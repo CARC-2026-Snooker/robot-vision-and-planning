@@ -10,81 +10,40 @@ import socket
 import json
 import subprocess
 
-# --- 1. DEFINE YOUR FIELD / KNOWN TAGS ---
-KNOWN_TAGS = { 
-    1: {"x": 1.262, "y": 1.05, "facing_angle": 270},
-    2: {"x": -0.062, "y": 1.05, "facing_angle": 270},
-    3: {"x": 0, "y": 0, "facing_angle": 270},
-    4: {"x": 0.6, "y": 0, "facing_angle": 270},
-    5: {"x": 1.2, "y": 0, "facing_angle": 270},
-}
-
-# Unique BGR colors assigned to each tag ID
-TAG_COLORS = {
-    1: (255, 105, 180), # Hot Pink
-    2: (0, 255, 255),   # Yellow
-    3: (0, 165, 255),   # Orange
-    4: (255, 255, 0),   # Cyan
-    5: (255, 0, 255),   # Magenta
-}
-
-# Format: (x_min, y_min, x_max, y_max) in meters.
-ARENA_BOUNDS = (0.0, 0.0, 1.2, 3.6)
-
-# --- 2. DETECTION ZONES (For Visual Overlay) ---
-DETECTION_ZONES = {
-    "B": (390, 590, 100, 100),
-    "C": (620, 550, 70, 70),
-    "D": (810, 550, 70, 70),
-    "E": (1000, 560, 70, 70),
-    "F": (1180, 550, 70, 70),
-    "G": (1380, 550, 70, 70),
-    "A": (1590, 590, 100, 100),
-}
-
-MAX_TAG_DISTANCE = 10.0      
-OUT_OF_BOUNDS_LEEWAY = 0.15  
-MAX_POSE_JUMP = 0.5       
-TRACKING_TIMEOUT = 0.3       
-
-BASE_STILL_THRESHOLD = 0.005   
-BASE_MOVE_THRESHOLD = 0.030    
-STILL_ALPHA = 0.005            
-MOVE_ALPHA = 0.25
-
-# Consensus weighting sigma (metres): tags whose estimate deviates more than this
-# from the distance-weighted mean are soft-rejected. 45mm is generous for real noise.
-CONSENSUS_SIGMA = 0.045
-
-# Exposure brightness compensation — see sniper_4k.py for explanation.
-# HD_BRIGHTNESS_BOOST = 1.8   # 1.0 = off, 1.5–2.5 = typical low-exposure range
-HD_BRIGHTNESS_BOOST = 1.0   # 1.0 = off, 1.5–2.5 = typical low-exposure range
-
-CROP_TOP_PERCENT = 0.20       
-CROP_BOTTOM_PERCENT = 0.20    
-MASK_ALPHA = 0.3              
-
-SCALE = 200    
-PADDING = 60   
+# ── Import all settings from central config ──────────────────────────────────
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from config import (
+    KNOWN_TAGS, TAG_COLORS, ARENA_BOUNDS,
+    HD_DETECTION_ZONES as DETECTION_ZONES,
+    CAM_HD_INDEX, TAG_SIZE_M,
+    HD_RESOLUTION, HD_FPS, HD_CAM_PARAMS, HD_CROP_TOP as CROP_TOP_PERCENT,
+    HD_CROP_BOT as CROP_BOTTOM_PERCENT,
+    HD_MAX_TAG_DIST as MAX_TAG_DISTANCE,
+    HD_OUT_OF_BOUNDS as OUT_OF_BOUNDS_LEEWAY,
+    HD_MAX_POSE_JUMP as MAX_POSE_JUMP,
+    HD_TRACKING_TIMEOUT as TRACKING_TIMEOUT,
+    HD_STILL_ALPHA as STILL_ALPHA, HD_MOVE_ALPHA as MOVE_ALPHA,
+    HD_STILL_THR as BASE_STILL_THRESHOLD, HD_MOVE_THR as BASE_MOVE_THRESHOLD,
+    HD_CONSENSUS_SIGMA as CONSENSUS_SIGMA, HD_HISTORY_LEN,
+    HD_CAM_FORWARD_M, HD_CAM_SIDEWAYS_M,
+    LINE_INTERSECT_BLEND,
+    DETECT_EVERY_N_FRAMES, DISPLAY_SCALE, HD_BRIGHTNESS_BOOST,
+    MAP_SCALE as SCALE, MAP_PADDING as PADDING,
+    TELEMETRY_PORT, MOVEMENT_HOST, MOVEMENT_CMD_PORT,
+    MOVE_DEAD_MM, ROT_DEAD_DEG,
+)
+from tracking import (
+    get_global_camera_pose,
+    apply_cam_offset,
+    fuse_tag_estimates,
+    compute_line_intersections,
+)
+from movement_client import MovementClient, compute_move_cmd
 
 arena_w_meters = ARENA_BOUNDS[2] - ARENA_BOUNDS[0]
 arena_h_meters = ARENA_BOUNDS[3] - ARENA_BOUNDS[1]
-
-CANVAS_WIDTH = int(arena_w_meters * SCALE) + (2 * PADDING)
+CANVAS_WIDTH  = int(arena_w_meters * SCALE) + (2 * PADDING)
 CANVAS_HEIGHT = int(arena_h_meters * SCALE) + (2 * PADDING)
-
-def get_global_camera_pose(tag_id, t, R):
-    if tag_id not in KNOWN_TAGS: return None
-    cam_pos_in_tag_frame = -np.transpose(R) @ t
-    local_x, local_z = cam_pos_in_tag_frame[0][0], cam_pos_in_tag_frame[2][0]
-    tag_info = KNOWN_TAGS[tag_id]
-    theta = math.radians(tag_info["facing_angle"])
-    global_cam_x = tag_info["x"] + (local_z * math.cos(theta)) - (local_x * math.sin(theta))
-    global_cam_y = tag_info["y"] + (local_z * math.sin(theta)) + (local_x * math.cos(theta))
-    tag_space_dx, tag_space_dz = R[2, 0], R[2, 2]
-    global_dx = (tag_space_dz * math.cos(theta)) - (tag_space_dx * math.sin(theta))
-    global_dy = (tag_space_dz * math.sin(theta)) + (tag_space_dx * math.cos(theta))
-    return (global_cam_x, global_cam_y, global_dx, global_dy)
 
 def world_to_pixel(x, y):
     px = int((x - ARENA_BOUNDS[0]) * SCALE) + PADDING
@@ -98,21 +57,16 @@ def draw_map_line(canvas, x1, y1, x2, y2, color=(255, 255, 255), thickness=2):
 def open_hd_camera():
     """Open and configure the HD webcam. Returns cap handle."""
     if sys.platform.startswith('win'):
-        cap = cv2.VideoCapture(3, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(CAM_HD_INDEX, cv2.CAP_DSHOW)
     else:
-        cap = cv2.VideoCapture(3, cv2.CAP_V4L2)
+        cap = cv2.VideoCapture(CAM_HD_INDEX, cv2.CAP_V4L2)
 
-    # ORIGINAL OPTIMIZED VIDEO CAP SETTINGS — do not change
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  HD_RESOLUTION[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HD_RESOLUTION[1])
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_FPS, HD_FPS)
     cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-
-    # setting exposure manually so less blur on movement
-    # cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0) 
-    # cap.set(cv2.CAP_PROP_EXPOSURE, -4.0) # Try values between -1 and -9 
 
     for _ in range(5):
         cap.read()
@@ -123,10 +77,13 @@ def open_hd_camera():
 
 def main():
     detector = Detector(families="tag36h11")
-    tag_size_meters = 0.11
+    tag_size_meters = TAG_SIZE_M
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    TARGET_IP, TARGET_PORT = "127.0.0.1", 5005
+    TARGET_IP, TARGET_PORT = "127.0.0.1", TELEMETRY_PORT
+
+    # Movement client — sends drive commands to movement_server.py
+    mc = MovementClient()
 
     # -----------------------------------------------------------------------
     # OUTER RESTART LOOP
@@ -139,15 +96,13 @@ def main():
 
         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        # base_params = [1996.94*0.99444, 1998.60*0.99444, 827.66, 460.60]
-        base_params = [1924.70, 1924.67, 907.46, 483.50]
         scale_factor = actual_h / 1080.0
-        camera_params = [p * scale_factor for p in base_params]
+        camera_params = [p * scale_factor for p in HD_CAM_PARAMS]
 
         scale_x = actual_w / 1920.0
         scale_y = actual_h / 1080.0
 
-        history_raw_x, history_raw_y = deque(maxlen=15), deque(maxlen=15)
+        history_raw_x, history_raw_y = deque(maxlen=HD_HISTORY_LEN), deque(maxlen=HD_HISTORY_LEN)
         last_x, last_y, last_dx, last_dy = 0.0, 0.0, 1.0, 0.0
         initialized = False
         last_seen_time = time.time()
@@ -160,6 +115,8 @@ def main():
         print("\n[HD Navigator] Online. Press 's' to scan targets, 'q' to quit.")
 
         quit_requested = False  # propagate 'q' out of the inner loop
+        _frame_count = 0        # for DETECT_EVERY_N_FRAMES skipping
+        debug_tag_estimates = []  # holds last detection result; reused on skip frames
 
         # ---- INNER FRAME LOOP ----
         while True:
@@ -202,12 +159,18 @@ def main():
                 )
 
             y_start, y_end = int(h * CROP_TOP_PERCENT), int(h * (1.0 - CROP_BOTTOM_PERCENT))
-            gray = cv2.cvtColor(clean_frame, cv2.COLOR_BGR2GRAY)
-            gray_cropped = gray[y_start:y_end, :]
 
-            adj_camera_params = [camera_params[0], camera_params[1], camera_params[2], camera_params[3] - y_start]
-            tags = detector.detect(gray_cropped, estimate_tag_pose=True, camera_params=adj_camera_params, tag_size=tag_size_meters)
-            debug_tag_estimates = []
+            # ── AprilTag detection (skip frames on Pi for performance) ────
+            _frame_count += 1
+            run_detection = (_frame_count % DETECT_EVERY_N_FRAMES == 0)
+            if run_detection:
+                gray = cv2.cvtColor(clean_frame, cv2.COLOR_BGR2GRAY)
+                gray_cropped = gray[y_start:y_end, :]
+                adj_camera_params = [camera_params[0], camera_params[1], camera_params[2], camera_params[3] - y_start]
+                tags = detector.detect(gray_cropped, estimate_tag_pose=True, camera_params=adj_camera_params, tag_size=tag_size_meters)
+                debug_tag_estimates = []   # fresh results this frame
+            else:
+                tags = []   # skip detection; keep previous debug_tag_estimates for display
 
             for tag in tags:
                 tag.corners[:, 1] += y_start
@@ -226,27 +189,18 @@ def main():
                 
                 if pose_data:
                     dist = math.sqrt(t[0][0]**2 + t[1][0]**2 + t[2][0]**2)
-                    
                     if dist > MAX_TAG_DISTANCE:
                         continue
-                    
-                    global_cam_x, global_cam_y, global_dx, global_dy = pose_data
-                    
-                    if not (ARENA_BOUNDS[0] - OUT_OF_BOUNDS_LEEWAY <= global_cam_x <= ARENA_BOUNDS[2] + OUT_OF_BOUNDS_LEEWAY and
-                            ARENA_BOUNDS[1] - OUT_OF_BOUNDS_LEEWAY <= global_cam_y <= ARENA_BOUNDS[3] + OUT_OF_BOUNDS_LEEWAY):
-                        continue
-                    
-                    if initialized:
-                        jump_dist = math.sqrt((global_cam_x - last_x)**2 + (global_cam_y - last_y)**2)
-                        if jump_dist > MAX_POSE_JUMP:
-                            continue 
-                    
+                    cam_x, cam_y, gdx, gdy = pose_data
+                    # Apply camera-to-robot offset
+                    robot_x, robot_y = apply_cam_offset(cam_x, cam_y, gdx, gdy,
+                                                         HD_CAM_FORWARD_M, HD_CAM_SIDEWAYS_M)
+                    robot_pose = (robot_x, robot_y, gdx, gdy)
+                    w = 1.0 / (dist**3 + 0.001)
                     debug_tag_estimates.append({
-                        "id": tag.tag_id,
-                        "pose": pose_data,
-                        "distance": dist
+                        "id": tag.tag_id, "pose": robot_pose,
+                        "dist": dist, "w": w
                     })
-
                     text = f"ID:{tag.tag_id} -> Dist:{dist:.2f}m"
                     cv2.putText(frame, text, (center[0] - 50, center[1] - 20), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, tag_color, 2)
@@ -254,64 +208,28 @@ def main():
             if len(debug_tag_estimates) > 0:
                 last_seen_time = time.time()
 
-                # ── Step 1: distance-weighted mean (initial estimate) ──────
-                total_weight_init = 0.0
-                weighted_x_init = weighted_y_init = 0.0
-                weighted_dx_init = weighted_dy_init = 0.0
-                sum_distances = 0.0
-                for entry in debug_tag_estimates:
-                    pose, dist = entry["pose"], entry["distance"]
-                    sum_distances += dist
-                    w = 1.0 / (dist**3 + 0.001)
-                    weighted_x_init  += pose[0] * w
-                    weighted_y_init  += pose[1] * w
-                    weighted_dx_init += pose[2] * w
-                    weighted_dy_init += pose[3] * w
-                    total_weight_init += w
-                init_x = weighted_x_init / total_weight_init
-                init_y = weighted_y_init / total_weight_init
+                # ── Fuse tag estimates (consensus + dist^2 weighting) ──────
+                fused = fuse_tag_estimates(debug_tag_estimates, last_x, last_y, initialized)
+                if fused:
+                    raw_avg_x, raw_avg_y, raw_avg_dx, raw_avg_dy, sum_distances, n = fused
 
-                # ── Step 2: consensus soft-rejection ──────────────────────
-                # Tags whose estimate is far from the initial mean get
-                # exponentially down-weighted. This rejects oblique-angle
-                # outliers without hard-cutting any tag entirely.
-                total_weight = 0.0
-                weighted_x = weighted_y = 0.0
-                weighted_dx = weighted_dy = 0.0
-                for entry in debug_tag_estimates:
-                    pose, dist = entry["pose"], entry["distance"]
-                    dev = math.hypot(pose[0] - init_x, pose[1] - init_y)
-                    consensus_w = math.exp(-dev**2 / (2 * CONSENSUS_SIGMA**2))
-                    dist_w = 1.0 / (dist**3 + 0.001)
-                    w = dist_w * consensus_w
-                    weighted_x  += pose[0] * w
-                    weighted_y  += pose[1] * w
-                    weighted_dx += pose[2] * w
-                    weighted_dy += pose[3] * w
-                    total_weight += w
+                    # ── Line-intersection extra estimate ───────────────────
+                    isect = compute_line_intersections(debug_tag_estimates)
+                    if isect and LINE_INTERSECT_BLEND > 0:
+                        raw_avg_x = (1-LINE_INTERSECT_BLEND)*raw_avg_x + LINE_INTERSECT_BLEND*isect[0]
+                        raw_avg_y = (1-LINE_INTERSECT_BLEND)*raw_avg_y + LINE_INTERSECT_BLEND*isect[1]
 
-                raw_avg_x  = weighted_x  / total_weight
-                raw_avg_y  = weighted_y  / total_weight
-                raw_avg_dx = weighted_dx / total_weight
-                raw_avg_dy = weighted_dy / total_weight
+                    history_raw_x.append(raw_avg_x); history_raw_y.append(raw_avg_y)
+                    if not initialized:
+                        last_x, last_y, last_dx, last_dy = raw_avg_x, raw_avg_y, raw_avg_dx, raw_avg_dy
+                        initialized = True
+                    
+                    movement_metric = math.sqrt(np.std(history_raw_x)**2 + np.std(history_raw_y)**2) if len(history_raw_x) >= 2 else 0.0
 
-                mag = math.sqrt(raw_avg_dx**2 + raw_avg_dy**2)
-                if mag > 0: raw_avg_dx /= mag; raw_avg_dy /= mag
-
-                history_raw_x.append(raw_avg_x); history_raw_y.append(raw_avg_y)
-                if not initialized:
-                    last_x, last_y, last_dx, last_dy = raw_avg_x, raw_avg_y, raw_avg_dx, raw_avg_dy
-                    initialized = True
-                
-                movement_metric = math.sqrt(np.std(history_raw_x)**2 + np.std(history_raw_y)**2) if len(history_raw_x) >= 2 else 0.0
-
-                # ── Step 3: dist^2 threshold scaling ──────────────────────
-                # Pose noise grows roughly as dist^2 at oblique angles, so
-                # scale thresholds by dist^2 (capped) instead of linear dist.
-                avg_dist = sum_distances / len(debug_tag_estimates)
-                dist_multiplier = max(1.0, min(avg_dist ** 2, 12.0))
-                still_threshold = BASE_STILL_THRESHOLD * dist_multiplier
-                move_threshold  = BASE_MOVE_THRESHOLD  * dist_multiplier
+                    avg_dist = sum_distances / n
+                    dist_multiplier = max(1.0, min(avg_dist ** 2, 12.0))
+                    still_threshold = BASE_STILL_THRESHOLD * dist_multiplier
+                    move_threshold  = BASE_MOVE_THRESHOLD  * dist_multiplier
                 
                 if movement_metric <= still_threshold:
                     alpha, state_text = STILL_ALPHA, "STILL"
@@ -337,12 +255,40 @@ def main():
                 text_color = (0, 0, 255)
 
             # On-screen telemetry readout
-            cv2.putText(frame, f"State: {state_text} | Pos: ({last_x*100:.1f}cm, {last_y*100:.1f}cm)", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
+            cv2.putText(frame, f"State: {state_text} | Pos: ({last_x*100:.1f}cm, {last_y*100:.1f}cm)", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, text_color, 2)
 
-            # UDP Telemetry Broadcast
+            # ── Compute movement command for AIMING state ────────────────
+            move_cmd_dict = {"cmd": "stop"}
+            if APP_STATE == "AIMING" and initialized and matched_target_zone is not None:
+                plan = shooting_plans[matched_target_zone]
+                plan_x, plan_y = plan["robot_alignment_xy"]
+                plan_head = plan["firing_angle_deg"]
+                curr_x_mm = last_x * 1000; curr_y_mm = last_y * 1000
+                curr_head = (math.degrees(math.atan2(last_dy, last_dx)) + 360) % 360
+                ang_err = curr_head - plan_head
+                if ang_err >  180: ang_err -= 360
+                if ang_err < -180: ang_err += 360
+                # Transform world errors into robot frame
+                x_err_w = curr_x_mm - plan_x; y_err_w = curr_y_mm - plan_y
+                side_err = -x_err_w * last_dy + y_err_w * last_dx
+                fwd_err  =  x_err_w * last_dx + y_err_w * last_dy
+                cmd = compute_move_cmd(x_error_mm=side_err, y_error_mm=-fwd_err,
+                                       ang_error_deg=ang_err)
+                move_cmd_dict = cmd.to_dict()
+                mc.send(cmd)
+
+            # UDP Telemetry Broadcast (extended packet)
             telemetry_packet = {
-                "initialized": initialized, "x_cm": round(last_x * 100, 2), "y_cm": round(last_y * 100, 2),
-                "heading_dx": round(last_dx, 3), "heading_dy": round(last_dy, 3), "state": state_text
+                "initialized": initialized,
+                "x_mm":  round(last_x * 1000, 1),
+                "y_mm":  round(last_y * 1000, 1),
+                "x_cm":  round(last_x * 100, 2),   # backwards compat
+                "y_cm":  round(last_y * 100, 2),
+                "heading_dx": round(last_dx, 3),
+                "heading_dy": round(last_dy, 3),
+                "state":      state_text,
+                "app_state":  APP_STATE,
+                "movement_cmd": move_cmd_dict,
             }
             try:
                 sock.sendto(json.dumps(telemetry_packet).encode('utf-8'), (TARGET_IP, TARGET_PORT))
@@ -365,7 +311,11 @@ def main():
                         with open("robot_shooting_plan.json", "r") as f:
                             shooting_plans = json.load(f)
                         APP_STATE = "AIMING"
-                        print(f"Loaded plans for zones: {list(shooting_plans.keys())}")
+                        if list(shooting_plans.keys()):
+                            print(f"Loaded plans for zones: {list(shooting_plans.keys())}")
+                        else:
+                            print("no zones detected")
+                            sys.exit()
 
             elif APP_STATE == "AIMING":
                 matched_target_zone = None
@@ -431,7 +381,7 @@ def main():
                 cv2.rectangle(map_canvas, (pt[0]-6, pt[1]-6), (pt[0]+6, pt[1]+6), color, -1)
                 cv2.putText(map_canvas, f"ID {tag_id}", (pt[0]-14, pt[1]-12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
-            # 4. Plot Debug Tracking Lines & Individual Camera Heading Vectors
+            # ── Per-tag tracking lines (solid, tag colour) ──────────────
             for entry in debug_tag_estimates:
                 tag_id = entry["id"]
                 pose = entry["pose"]
@@ -448,6 +398,27 @@ def main():
                     arrow_length = 0.15 
                     pt_arrow_end = world_to_pixel(pose[0] + pose[2] * arrow_length, pose[1] + pose[3] * arrow_length)
                     cv2.arrowedLine(map_canvas, pt_cam_pred, pt_arrow_end, color, 1, tipLength=0.25)
+
+            # ── Line-intersection rays (dashed white — distinguishable from above) ──
+            isect_viz = compute_line_intersections(debug_tag_estimates)
+            if isect_viz:
+                isect_pt = world_to_pixel(isect_viz[0], isect_viz[1])
+                cv2.circle(map_canvas, isect_pt, 6, (255, 255, 255), 2)   # white ring
+                # Draw rays from each tag toward the intersection point
+                for entry in debug_tag_estimates:
+                    tid = entry["id"]
+                    if tid in KNOWN_TAGS:
+                        ti = KNOWN_TAGS[tid]
+                        pt_tag = world_to_pixel(ti["x"], ti["y"])
+                        # Dashed line: draw short segments
+                        x0, y0 = pt_tag; x1, y1 = isect_pt
+                        steps = max(1, int(math.hypot(x1-x0, y1-y0) / 8))
+                        for s in range(0, steps, 2):
+                            fx0 = int(x0 + (x1-x0)*s/steps)
+                            fy0 = int(y0 + (y1-y0)*s/steps)
+                            fx1 = int(x0 + (x1-x0)*min(s+1,steps)/steps)
+                            fy1 = int(y0 + (y1-y0)*min(s+1,steps)/steps)
+                            cv2.line(map_canvas, (fx0, fy0), (fx1, fy1), (200, 200, 200), 1)
          
             # --- DYNAMIC PLAN VISUALIZER (AIMING state only) ---
             if APP_STATE == "AIMING" and shooting_plans:
@@ -502,9 +473,17 @@ def main():
                 cv2.arrowedLine(map_canvas, cam_pt, heading_end, (0, 255, 0), 2, tipLength=0.2)
                 cv2.putText(map_canvas, "Robot", (cam_pt[0]-16, cam_pt[1]+24), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
 
-            # Show Both Windows
-            cv2.imshow("HD Navigator", frame)
-            cv2.imshow("2D Real-Time Field Map", map_canvas)
+            # Show Both Windows (scale down for Pi GPU performance)
+            if DISPLAY_SCALE != 1.0:
+                dw = int(frame.shape[1] * DISPLAY_SCALE)
+                dh = int(frame.shape[0] * DISPLAY_SCALE)
+                cv2.imshow("HD Navigator", cv2.resize(frame, (dw, dh)))
+                mw = int(map_canvas.shape[1] * DISPLAY_SCALE)
+                mh = int(map_canvas.shape[0] * DISPLAY_SCALE)
+                cv2.imshow("2D Real-Time Field Map", cv2.resize(map_canvas, (mw, mh)))
+            else:
+                cv2.imshow("HD Navigator", frame)
+                cv2.imshow("2D Real-Time Field Map", map_canvas)
             
             if key == ord('q'):
                 quit_requested = True

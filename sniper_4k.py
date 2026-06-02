@@ -53,13 +53,29 @@ CROP_TOP_PCT        = 0.20
 CROP_BOT_PCT        = 0.20
 
 # Sniper-mode thresholds — slightly tighter than driving because we're stationary
-BASE_STILL_THRESHOLD = 0.003   # was 0.005 in new_main3 — sniper is closer/stationary
+BASE_STILL_THRESHOLD = 0.005   # was 0.005 in new_main3 — sniper is closer/stationary
 BASE_MOVE_THRESHOLD  = 0.020   # was 0.030
 STILL_ALPHA          = 0.005   # same
 MOVE_ALPHA           = 0.30    # slightly faster than 0.25 so it follows when pushed
 
 # Consensus weighting: same as new_main3.py — see comments there
 CONSENSUS_SIGMA = 0.045   # 45mm soft-rejection radius for outlier tag estimates
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAMERA-TO-ROBOT CENTRE OFFSET
+# The HD camera lens is 5cm FORWARD of the robot centre.
+# get_global_camera_pose() returns the camera optical centre.
+# Subtract this offset along the heading to get the true robot centre.
+# The 4K camera's forward offset (20cm) does NOT need correction here:
+# atan2(t_x, t_z) measures direction in camera frame, which is independent
+# of where the lens sits — only the heading matters, not the absolute position.
+# ─────────────────────────────────────────────────────────────────────────────
+HD_CAM_FORWARD_M = 0.05   # metres — HD lens is this far forward of robot centre
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RASPBERRY PI PERFORMANCE (HD tracking loop)
+# ─────────────────────────────────────────────────────────────────────────────
+DETECT_EVERY_N_FRAMES = 1    # run AprilTag detection every N HD frames
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SHOT MODE
@@ -165,15 +181,15 @@ class Sniper4kThread(threading.Thread):
         self.detector = Detector(families="tag36h11")
 
         if sys.platform.startswith('win'):
-            self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+            self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
         else:
-            self.cap = cv2.VideoCapture(1, cv2.CAP_V4L2)
-        # self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  3840)
-        # self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
+            self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  3840)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
         # self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  2560)
         # self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1440)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        # self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
+        # self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
         # Read actual delivered resolution so params scale correctly
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -414,12 +430,12 @@ def main():
 
     # ── HD camera (position — 30fps) ─────────────────────────────────────────
     if sys.platform.startswith('win'):
-        cap_hd = cv2.VideoCapture(3, cv2.CAP_DSHOW)
+        cap_hd = cv2.VideoCapture(2, cv2.CAP_DSHOW)
     else:
-        cap_hd = cv2.VideoCapture(3, cv2.CAP_V4L2)
+        cap_hd = cv2.VideoCapture(2, cv2.CAP_V4L2)
     cap_hd.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    cap_hd.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-    cap_hd.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap_hd.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
+    cap_hd.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
     cap_hd.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap_hd.set(cv2.CAP_PROP_FPS, 30)
     cap_hd.set(cv2.CAP_PROP_AUTOFOCUS, 0)
@@ -432,8 +448,8 @@ def main():
         time.sleep(0.05)
 
     actual_h_hd  = int(cap_hd.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    # base_hd = [1996.94*0.99444, 1998.60*0.99444, 827.66, 460.60]
-    base_hd = [1924.70, 1924.67, 907.46, 483.50]
+    base_hd = [1996.94*0.99444, 1998.60*0.99444, 827.66, 460.60]
+    # base_hd = [1924.70, 1924.67, 907.46, 483.50]
     scale_hd     = actual_h_hd / 1080.0
     camera_params_hd = [p * scale_hd for p in base_hd]
 
@@ -456,6 +472,9 @@ def main():
     print(f"[Sniper] HD cam  → position (X, Y, heading) at 30fps")
     print(f"[Sniper] 4K cam  → angle correction (threaded, non-blocking)")
 
+    _hd_frame_count  = 0
+    debug_tag_estimates = []   # persists across skipped frames
+
     while True:
         # ════════════════════════════════════════════════════════════════════
         # 1. HD FRAME — position tracking (runs at full 30fps)
@@ -472,13 +491,18 @@ def main():
         h_hd = frame_hd.shape[0]
         y_start = int(h_hd * CROP_TOP_PCT)
         y_end   = int(h_hd * (1.0 - CROP_BOT_PCT))
-        gray_hd = cv2.cvtColor(frame_hd, cv2.COLOR_BGR2GRAY)[y_start:y_end, :]
-        adj_params_hd = [camera_params_hd[0], camera_params_hd[1],
-                         camera_params_hd[2], camera_params_hd[3] - y_start]
 
-        tags_hd = detector_hd.detect(gray_hd, estimate_tag_pose=True,
-                                     camera_params=adj_params_hd, tag_size=tag_size_hd)
-        debug_tag_estimates = []
+        # ── AprilTag detection (skip frames on Pi for performance) ────────
+        _hd_frame_count += 1
+        if _hd_frame_count % DETECT_EVERY_N_FRAMES == 0:
+            gray_hd = cv2.cvtColor(frame_hd, cv2.COLOR_BGR2GRAY)[y_start:y_end, :]
+            adj_params_hd = [camera_params_hd[0], camera_params_hd[1],
+                             camera_params_hd[2], camera_params_hd[3] - y_start]
+            tags_hd = detector_hd.detect(gray_hd, estimate_tag_pose=True,
+                                         camera_params=adj_params_hd, tag_size=tag_size_hd)
+            debug_tag_estimates = []
+        else:
+            tags_hd = []   # skip; keep previous debug_tag_estimates
 
         for tag in tags_hd:
             tag.corners[:, 1] += y_start
@@ -521,6 +545,10 @@ def main():
             raw_dx /= total_w; raw_dy /= total_w
             mag = math.hypot(raw_dx, raw_dy)
             if mag > 0: raw_dx /= mag; raw_dy /= mag
+
+            # ── Camera-to-robot-centre offset correction ───────────────────
+            raw_x -= HD_CAM_FORWARD_M * raw_dx
+            raw_y -= HD_CAM_FORWARD_M * raw_dy
 
             history_raw_x.append(raw_x)
             history_raw_y.append(raw_y)

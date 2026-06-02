@@ -47,17 +47,17 @@ def detect_balls_in_zones(image_path = None, waitkey = 1):
         
     # 2. Define Regions of Interest (ROIs)
     zones = {
-        "B": (390, 590, 100, 100),
-        "C": (620, 550, 70, 70),
-        "D": (810, 550, 70, 70),
-        "E": (1000, 560, 70, 70),
-        "F": (1180, 550, 70, 70),
-        "G": (1380, 550, 70, 70),
-        "A": (1590, 590, 100, 100),
+        "B": (360, 560, 170, 170),
+        "C": (610, 500, 130, 130),
+        "D": (790, 500, 130, 130),
+        "E": (960, 520, 130, 130),
+        "F": (1130, 500, 130, 130),
+        "G": (1320, 500, 130, 130),
+        "A": (1550, 560, 170, 170),
     }
 
-    for zone, region in zones.items():
-        zones[zone] = [int(x * (720.0/1080.0)) for x in region]
+    for zone, region in zones.items(): # change as set / dont change
+        zones[zone] = [int(x * (1080.0/1080.0)) for x in region]
 
     # 3. Convert image to HSV
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -74,7 +74,7 @@ def detect_balls_in_zones(image_path = None, waitkey = 1):
     lower_white = np.array([180, 75, 255]) 
     upper_white = np.array([180, 75, 255])
 
-    PERCENT_THRESHOLD = 0.10
+    PERCENT_THRESHOLD = 0.05
 
     # Generate global masks for debugging
     mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)

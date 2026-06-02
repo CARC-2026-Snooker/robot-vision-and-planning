@@ -1,72 +1,31 @@
 import numpy as np
 import json
 import math
+import sys
+import os
 import matplotlib.pyplot as plt
+
+# ── Import all settings from central config ──────────────────────────────────
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from config import (
+    POCKETS_MM as POCKETS,
+    CORNER_OFFSET_MM, CORNER_EFFECTIVE_POCKETS,
+    REAL_ZONES,
+    BALL_DIAMETER_MM as BALL_DIAMETER,
+    ROBOT_X_MIN, ROBOT_X_MAX, ROBOT_SHOOT_Y,
+    SHOT_WEIGHT_DISTANCE as WEIGHT_DISTANCE_DEFAULT,
+    SHOT_WEIGHT_ANGLE    as WEIGHT_ANGLE_DEFAULT,
+    SHOT_MAX_CUT_ANGLE   as MAX_CUT_ANGLE_DEFAULT,
+    KNOWN_TAGS, TAG_COLORS,
+    HD_BALL_RED_LO1, HD_BALL_RED_HI1,
+    HD_BALL_RED_LO2, HD_BALL_RED_HI2,
+    HD_BALL_BLUE_LO, HD_BALL_BLUE_HI,
+    HD_BALL_PERCENT_THRESHOLD,
+    HD_DETECTION_ZONES,
+)
 
 # Import the vision function directly from your main script
 from main import detect_balls_in_zones
-
-# ==========================================
-# TABLE & ROBOT ENVIRONMENT SETUP (In Millimeters)
-# ==========================================
-TABLE_WIDTH_X = 1200   # Short axis (width) as specified
-TABLE_LENGTH_Y = 3600  # Total length (2400mm green + 1200mm white)
-BALL_DIAMETER = 52.5   # Full diameter of Aramith balls (52.5 mm)
-
-ROBOT_SIZE = 450
-ROBOT_HALF = ROBOT_SIZE / 2.0
-
-# Robot Walkable Width boundaries (X Axis)
-ROBOT_X_MIN = ROBOT_HALF + 20       
-ROBOT_X_MAX = TABLE_WIDTH_X - ROBOT_HALF - 20 
-
-# Robot Walkable Length boundaries (Y Axis)
-# "starts at y 210, length 150 to the back" -> Y from 2100 to 3600
-ROBOT_SHOOT_Y = 2100 + ROBOT_HALF + 50   # Centerline axis line for robot shooting position
-
-# 5 Hole Target Locations (0,0 is at Hole 3 / top-left corner)
-POCKETS = {
-    "Hole_3": (0, 0),         # Top-Left Corner (closest to C)
-    "Hole_4": (600, 0),       # Top-Middle
-    "Hole_5": (1200, 0),      # Top-Right Corner
-    "Hole_2": (0, 1050),      # Left-Side Pocket near foul area
-    "Hole_1": (1200, 1050)    # Right-Side Pocket near foul area
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CORNER POCKET OFFSET
-#
-# When shooting at a corner pocket (Hole_3 or Hole_5) from a shallow angle,
-# aiming at the pocket CENTER risks clipping the side wall.
-# This offset shifts the effective aim point inward along the pocket edge:
-#   Hole_3 (left corner, x=0)    → effective aim at (CORNER_OFFSET_MM, 0)
-#   Hole_5 (right corner, x=1200)→ effective aim at (1200 - CORNER_OFFSET_MM, 0)
-#
-# The planner computes ALL geometry (ghost ball, robot rx, firing angle)
-# using this effective aim point. The sniper_4k.py angle system works correctly
-# with this because it uses the real pocket position to compute target_relative_angle,
-# while fire_angle_deg encodes the correct direction toward the offset point.
-# The sniper's STEP 2 (lateral pixel check) also uses this same offset.
-#
-# Set to 0 to disable. Must be kept in sync with CORNER_OFFSET_MM in sniper_4k.py.
-# ─────────────────────────────────────────────────────────────────────────────
-CORNER_OFFSET_MM = 25.0   # mm inward from corner pocket center; 0 to ~50mm typical
-
-CORNER_EFFECTIVE_POCKETS = {
-    "Hole_3": (CORNER_OFFSET_MM, 0),
-    "Hole_5": (1200 - CORNER_OFFSET_MM, 0),
-}
-
-# Swapped and re-mapped coordinates for Placement Zones A-G (X=width, Y=length)
-REAL_ZONES = {
-    "A": (1050, 1050),
-    "B": (150, 1050), # "B": (120, 1100),
-    "C": (200, 300),  # Closest zone to Hole 3 (0,0)
-    "D": (400, 300),
-    "E": (600, 500),
-    "F": (800, 300),
-    "G": (1000, 300)
-}
 
 def calculate_ghost_ball(target_pos, pocket_pos):
     """Calculates ghost ball exactly one ball diameter behind target on the pocket line."""
