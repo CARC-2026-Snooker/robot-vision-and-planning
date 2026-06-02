@@ -1,0 +1,19 @@
+Calculating calibration parameters... this might take a second.
+
+--- CALIBRATION SUCCESSFUL ---
+
+Your Camera Matrix:
+[[4.53422024e+03 0.00000000e+00 9.79267853e+02]
+ [0.00000000e+00 4.52808320e+03 7.75854272e+02]
+ [0.00000000e+00 0.00000000e+00 1.00000000e+00]]
+
+Your Distortion Coefficients:
+[[-1.23467127e+00  1.37940482e+01 -2.47010796e-02  6.62621201e-03
+  -1.51346017e+02]]
+
+=======================================================
+COPY AND PASTE THIS INTO YOUR APRILTAG SCRIPT:
+camera_params = [4534.22, 4528.08, 979.27, 775.85]
+=======================================================
+
+Total re-projection error: 0.1957

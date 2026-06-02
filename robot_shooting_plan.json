@@ -1,6 +1,6 @@
 {
     "B": {
-        "color": "Blue",
+        "color": "Red",
         "target_ball_zone": "B",
         "target_ball_real_xy": [
             150,
@@ -17,44 +17,6 @@
         ],
         "firing_angle_deg": 263.2,
         "cut_angle_deg": 0.0
-    },
-    "C": {
-        "color": "Blue",
-        "target_ball_zone": "C",
-        "target_ball_real_xy": [
-            200,
-            300
-        ],
-        "target_pocket": "Hole_3",
-        "ghost_ball_xy": [
-            226.45,
-            345.35
-        ],
-        "robot_alignment_xy": [
-            955.0,
-            2375.0
-        ],
-        "firing_angle_deg": 250.3,
-        "cut_angle_deg": 10.5
-    },
-    "D": {
-        "color": "Red",
-        "target_ball_zone": "D",
-        "target_ball_real_xy": [
-            400,
-            300
-        ],
-        "target_pocket": "Hole_4",
-        "ghost_ball_xy": [
-            370.88,
-            343.68
-        ],
-        "robot_alignment_xy": [
-            245.0,
-            2375.0
-        ],
-        "firing_angle_deg": 273.5,
-        "cut_angle_deg": 30.1
     },
     "E": {
         "color": "Red",
@@ -74,24 +36,5 @@
         ],
         "firing_angle_deg": 270.0,
         "cut_angle_deg": 0.0
-    },
-    "F": {
-        "color": "Red",
-        "target_ball_zone": "F",
-        "target_ball_real_xy": [
-            800,
-            300
-        ],
-        "target_pocket": "Hole_4",
-        "ghost_ball_xy": [
-            829.12,
-            343.68
-        ],
-        "robot_alignment_xy": [
-            955.0,
-            2375.0
-        ],
-        "firing_angle_deg": 266.5,
-        "cut_angle_deg": 30.1
     }
 }

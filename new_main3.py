@@ -57,7 +57,8 @@ MOVE_ALPHA = 0.25
 CONSENSUS_SIGMA = 0.045
 
 # Exposure brightness compensation — see sniper_4k.py for explanation.
-HD_BRIGHTNESS_BOOST = 1.8   # 1.0 = off, 1.5–2.5 = typical low-exposure range
+# HD_BRIGHTNESS_BOOST = 1.8   # 1.0 = off, 1.5–2.5 = typical low-exposure range
+HD_BRIGHTNESS_BOOST = 1.0   # 1.0 = off, 1.5–2.5 = typical low-exposure range
 
 CROP_TOP_PERCENT = 0.20       
 CROP_BOTTOM_PERCENT = 0.20    
@@ -97,9 +98,9 @@ def draw_map_line(canvas, x1, y1, x2, y2, color=(255, 255, 255), thickness=2):
 def open_hd_camera():
     """Open and configure the HD webcam. Returns cap handle."""
     if sys.platform.startswith('win'):
-        cap = cv2.VideoCapture(2, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(3, cv2.CAP_DSHOW)
     else:
-        cap = cv2.VideoCapture(2, cv2.CAP_V4L2)
+        cap = cv2.VideoCapture(3, cv2.CAP_V4L2)
 
     # ORIGINAL OPTIMIZED VIDEO CAP SETTINGS — do not change
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
@@ -110,8 +111,8 @@ def open_hd_camera():
     cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
 
     # setting exposure manually so less blur on movement
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0) 
-    cap.set(cv2.CAP_PROP_EXPOSURE, -4.0) # Try values between -1 and -9 
+    # cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0) 
+    # cap.set(cv2.CAP_PROP_EXPOSURE, -4.0) # Try values between -1 and -9 
 
     for _ in range(5):
         cap.read()
@@ -138,7 +139,8 @@ def main():
 
         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        base_params = [1996.94*0.99444, 1998.60*0.99444, 827.66, 460.60]
+        # base_params = [1996.94*0.99444, 1998.60*0.99444, 827.66, 460.60]
+        base_params = [1924.70, 1924.67, 907.46, 483.50]
         scale_factor = actual_h / 1080.0
         camera_params = [p * scale_factor for p in base_params]
 

@@ -1,0 +1,17 @@
+--- CALIBRATION SUCCESSFUL ---
+
+Your Camera Matrix:
+[[1.92470183e+03 0.00000000e+00 9.07456661e+02]
+ [0.00000000e+00 1.92467133e+03 4.83497504e+02]
+ [0.00000000e+00 0.00000000e+00 1.00000000e+00]]
+
+Your Distortion Coefficients:
+[[ 0.16147983 -0.9073361   0.00401268 -0.00428947  1.37020869]]
+
+=======================================================
+COPY AND PASTE THIS INTO YOUR APRILTAG SCRIPT:
+camera_params = [1924.70, 1924.67, 907.46, 483.50]
+=======================================================
+
+Total re-projection error: 0.0851
+(If the error is higher than 1.0, you might want to recalibrate with a flatter board or better lighting).

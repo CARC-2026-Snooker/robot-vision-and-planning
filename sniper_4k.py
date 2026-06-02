@@ -96,7 +96,8 @@ LATERAL_TOL_PX = 10
 # This multiplier is applied to every captured HD frame before display and tracking.
 # 1.0 = no change. 1.5–2.5 = typical useful range for low-exposure compensation.
 # Also applied in new_main3.py via the same constant name (keep them in sync).
-HD_BRIGHTNESS_BOOST = 1.8   # adjust to taste
+# HD_BRIGHTNESS_BOOST = 1.8   # adjust to taste
+HD_BRIGHTNESS_BOOST = 1.0   # adjust to taste
 BALL_HSV = {
     "Red":  [(np.array([0, 50, 20]),   np.array([15, 255, 255])),
              (np.array([165, 50, 20]), np.array([180, 255, 255]))],
@@ -109,7 +110,7 @@ BALL_HSV = {
 # Camera matrix from calibration script — verified values
 # ─────────────────────────────────────────────────────────────────────────────
 # Distortion coefficients from calibration
-DIST_COEFFS = np.array([[-1.41194961, 2.30627577, -0.01643747, 0.02638897, 10.04699549]])
+DIST_COEFFS = np.array([[-1.23467127e+00, 1.37940482e+01, -2.47010796e-02, 6.62621201e-03, -1.51346017e+02]])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -164,20 +165,23 @@ class Sniper4kThread(threading.Thread):
         self.detector = Detector(families="tag36h11")
 
         if sys.platform.startswith('win'):
-            self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
         else:
-            self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+            self.cap = cv2.VideoCapture(1, cv2.CAP_V4L2)
         # self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  3840)
         # self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  2560)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1440)
+        # self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  2560)
+        # self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1440)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
         # Read actual delivered resolution so params scale correctly
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self._actual_w = actual_w
         self._actual_h = actual_h
-        base_4k  = [6280.83, 6558.89, 811.37, 499.18]
+        # base_4k  = [6280.83, 6558.89, 811.37, 499.18]
+        base_4k  = [4534.22, 4528.08, 979.27, 775.85]
         scale    = actual_h / 1080.0
         self.camera_params_4k = [p * scale for p in base_4k]
 
@@ -410,9 +414,9 @@ def main():
 
     # ── HD camera (position — 30fps) ─────────────────────────────────────────
     if sys.platform.startswith('win'):
-        cap_hd = cv2.VideoCapture(2, cv2.CAP_DSHOW)
+        cap_hd = cv2.VideoCapture(3, cv2.CAP_DSHOW)
     else:
-        cap_hd = cv2.VideoCapture(2, cv2.CAP_V4L2)
+        cap_hd = cv2.VideoCapture(3, cv2.CAP_V4L2)
     cap_hd.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap_hd.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap_hd.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -421,14 +425,15 @@ def main():
     cap_hd.set(cv2.CAP_PROP_AUTOFOCUS, 0)
 
     # setting exposure manually so less blur on movement
-    cap_hd.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0) 
-    cap_hd.set(cv2.CAP_PROP_EXPOSURE, -4.0) # Try values between -1 and -9 
+    # cap_hd.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0) 
+    # cap_hd.set(cv2.CAP_PROP_EXPOSURE, -4.0) # Try values between -1 and -9 
     for _ in range(5):
         cap_hd.read()
         time.sleep(0.05)
 
     actual_h_hd  = int(cap_hd.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    base_hd      = [1996.94*0.99444, 1998.60*0.99444, 827.66, 460.60]
+    # base_hd = [1996.94*0.99444, 1998.60*0.99444, 827.66, 460.60]
+    base_hd = [1924.70, 1924.67, 907.46, 483.50]
     scale_hd     = actual_h_hd / 1080.0
     camera_params_hd = [p * scale_hd for p in base_hd]
 
