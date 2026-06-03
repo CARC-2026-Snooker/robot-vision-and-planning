@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from config import (
     KNOWN_TAGS, TAG_COLORS, ARENA_BOUNDS,
     HD_DETECTION_ZONES as DETECTION_ZONES,
-    CAM_HD_INDEX, TAG_SIZE_M,
+    CAM_FRONT, TAG_SIZE_M,
     HD_RESOLUTION, HD_FPS, HD_CAM_PARAMS, HD_CROP_TOP as CROP_TOP_PERCENT,
     HD_CROP_BOT as CROP_BOTTOM_PERCENT,
     HD_MAX_TAG_DIST as MAX_TAG_DISTANCE,
@@ -57,9 +57,9 @@ def draw_map_line(canvas, x1, y1, x2, y2, color=(255, 255, 255), thickness=2):
 def open_hd_camera():
     """Open and configure the HD webcam. Returns cap handle."""
     if sys.platform.startswith('win'):
-        cap = cv2.VideoCapture(CAM_HD_INDEX, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(CAM_FRONT, cv2.CAP_DSHOW)
     else:
-        cap = cv2.VideoCapture(CAM_HD_INDEX, cv2.CAP_V4L2)
+        cap = cv2.VideoCapture(CAM_FRONT, cv2.CAP_V4L2)
 
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  HD_RESOLUTION[0])
