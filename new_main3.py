@@ -195,6 +195,13 @@ def main():
                     # Apply camera-to-robot offset
                     robot_x, robot_y = apply_cam_offset(cam_x, cam_y, gdx, gdy,
                                                          HD_CAM_FORWARD_M, HD_CAM_SIDEWAYS_M)
+                    # Reject out-of-bounds estimates
+                    if not (ARENA_BOUNDS[0] - OUT_OF_BOUNDS_LEEWAY <= robot_x <= ARENA_BOUNDS[2] + OUT_OF_BOUNDS_LEEWAY and
+                            ARENA_BOUNDS[1] - OUT_OF_BOUNDS_LEEWAY <= robot_y <= ARENA_BOUNDS[3] + OUT_OF_BOUNDS_LEEWAY):
+                        continue
+                    # Reject implausible jumps when already tracking
+                    if initialized and math.hypot(robot_x - last_x, robot_y - last_y) > MAX_POSE_JUMP:
+                        continue
                     robot_pose = (robot_x, robot_y, gdx, gdy)
                     w = 1.0 / (dist**3 + 0.001)
                     debug_tag_estimates.append({
@@ -213,7 +220,7 @@ def main():
                 if fused:
                     raw_avg_x, raw_avg_y, raw_avg_dx, raw_avg_dy, sum_distances, n = fused
 
-                    # ── Line-intersection extra estimate ───────────────────
+                    # ── Circle-intersection extra estimate ─────────────────
                     isect = compute_line_intersections(debug_tag_estimates)
                     if isect and LINE_INTERSECT_BLEND > 0:
                         raw_avg_x = (1-LINE_INTERSECT_BLEND)*raw_avg_x + LINE_INTERSECT_BLEND*isect[0]
@@ -231,23 +238,23 @@ def main():
                     still_threshold = BASE_STILL_THRESHOLD * dist_multiplier
                     move_threshold  = BASE_MOVE_THRESHOLD  * dist_multiplier
                 
-                if movement_metric <= still_threshold:
-                    alpha, state_text = STILL_ALPHA, "STILL"
-                elif movement_metric >= move_threshold:
-                    alpha, state_text = MOVE_ALPHA, "MOVING"
-                else:
-                    ratio = (movement_metric - still_threshold) / (move_threshold - still_threshold)
-                    alpha, state_text = STILL_ALPHA + ratio * (MOVE_ALPHA - STILL_ALPHA), "TRANSITIONING"
+                    if movement_metric <= still_threshold:
+                        alpha, state_text = STILL_ALPHA, "STILL"
+                    elif movement_metric >= move_threshold:
+                        alpha, state_text = MOVE_ALPHA, "MOVING"
+                    else:
+                        ratio = (movement_metric - still_threshold) / (move_threshold - still_threshold)
+                        alpha, state_text = STILL_ALPHA + ratio * (MOVE_ALPHA - STILL_ALPHA), "TRANSITIONING"
+                        
+                    last_x = alpha * raw_avg_x + (1.0 - alpha) * last_x
+                    last_y = alpha * raw_avg_y + (1.0 - alpha) * last_y
+                    last_dx = alpha * raw_avg_dx + (1.0 - alpha) * last_dx
+                    last_dy = alpha * raw_avg_dy + (1.0 - alpha) * last_dy
                     
-                last_x = alpha * raw_avg_x + (1.0 - alpha) * last_x
-                last_y = alpha * raw_avg_y + (1.0 - alpha) * last_y
-                last_dx = alpha * raw_avg_dx + (1.0 - alpha) * last_dx
-                last_dy = alpha * raw_avg_dy + (1.0 - alpha) * last_dy
-                
-                mag_smooth = math.sqrt(last_dx**2 + last_dy**2)
-                if mag_smooth > 0: last_dx /= mag_smooth; last_dy /= mag_smooth
-                
-                text_color = (0, 255, 0)
+                    mag_smooth = math.sqrt(last_dx**2 + last_dy**2)
+                    if mag_smooth > 0: last_dx /= mag_smooth; last_dy /= mag_smooth
+                    
+                    text_color = (0, 255, 0)
             else:
                 if initialized and (time.time() - last_seen_time > TRACKING_TIMEOUT):
                     initialized = False; history_raw_x.clear(); history_raw_y.clear()
