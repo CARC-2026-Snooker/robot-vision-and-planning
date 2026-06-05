@@ -1,0 +1,96 @@
+Starting camera feed...
+Press 'c' to capture a frame when the checkerboard is detected.
+Press 'q' to finish capturing and calculate the calibration.
+Frame captured! Total: 1
+Frame captured! Total: 2
+Frame captured! Total: 3
+Frame captured! Total: 4
+Frame captured! Total: 5
+Frame captured! Total: 6
+Frame captured! Total: 7
+Frame captured! Total: 8
+Frame captured! Total: 9
+Frame captured! Total: 10
+Frame captured! Total: 11
+Frame captured! Total: 12
+Frame captured! Total: 13
+Frame captured! Total: 14
+Frame captured! Total: 15
+Frame captured! Total: 16
+Frame captured! Total: 17
+Frame captured! Total: 18
+Frame captured! Total: 19
+Frame captured! Total: 20
+Frame captured! Total: 21
+Frame captured! Total: 22
+Frame captured! Total: 23
+Frame captured! Total: 24
+Frame captured! Total: 25
+Frame captured! Total: 26
+Frame captured! Total: 27
+Frame captured! Total: 28
+Frame captured! Total: 29
+Frame captured! Total: 30
+Frame captured! Total: 31
+Frame captured! Total: 32
+Frame captured! Total: 33
+Frame captured! Total: 34
+Frame captured! Total: 35
+Frame captured! Total: 36
+Frame captured! Total: 37
+Frame captured! Total: 38
+Frame captured! Total: 39
+Frame captured! Total: 40
+Frame captured! Total: 41
+Frame captured! Total: 42
+Frame captured! Total: 43
+Frame captured! Total: 44
+Frame captured! Total: 45
+Frame captured! Total: 46
+Frame captured! Total: 47
+Frame captured! Total: 48
+Frame captured! Total: 49
+Frame captured! Total: 50
+Frame captured! Total: 51
+Frame captured! Total: 52
+Frame captured! Total: 53
+Frame captured! Total: 54
+Frame captured! Total: 55
+Frame captured! Total: 56
+Frame captured! Total: 57
+Frame captured! Total: 58
+Frame captured! Total: 59
+Frame captured! Total: 60
+Frame captured! Total: 61
+Frame captured! Total: 62
+Frame captured! Total: 63
+Frame captured! Total: 64
+Frame captured! Total: 65
+Frame captured! Total: 66
+Frame captured! Total: 67
+Frame captured! Total: 68
+Frame captured! Total: 69
+Frame captured! Total: 70
+Frame captured! Total: 71
+Frame captured! Total: 72
+
+Calculating calibration parameters... this might take a second.
+
+--- CALIBRATION SUCCESSFUL ---
+
+Your Camera Matrix:
+[[2.33801583e+03 0.00000000e+00 8.43705292e+02]
+ [0.00000000e+00 2.31626306e+03 3.52596378e+02]
+ [0.00000000e+00 0.00000000e+00 1.00000000e+00]]
+
+Your Distortion Coefficients:
+[[-2.46512311e-01  4.72856868e+00 -1.40853939e-02 -9.24473134e-03
+  -1.98916405e+01]]
+
+=======================================================
+COPY AND PASTE THIS INTO YOUR APRILTAG SCRIPT:
+camera_params = [2338.02, 2316.26, 843.71, 352.60]
+=======================================================
+
+Total re-projection error: 0.0598
+(If the error is higher than 1.0, you might want to recalibrate with a flatter board or better lighting).

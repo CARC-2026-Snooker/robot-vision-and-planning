@@ -33,9 +33,9 @@ def main():
     print("Press 'q' to finish capturing and calculate the calibration.")
     
     if sys.platform.startswith('win'):
-        cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture("/dev/camera_front", cv2.CAP_DSHOW)
     else:
-        cap = cv2.VideoCapture(1, cv2.CAP_V4L2) # Best for Raspberry Pi / Linux
+        cap = cv2.VideoCapture("/dev/camera_front", cv2.CAP_V4L2) # Best for Raspberry Pi / Linux
 
     if not cap.isOpened():
         raise IOError("Webcam could not be opened.")

@@ -172,7 +172,7 @@ def visualize_table_plan(shooting_plan):
     plt.tight_layout()
     plt.savefig("robot_shooting_map_2d.png", dpi=300)
     print("[SUCCESS] Top-down 2D strategy view saved as 'robot_shooting_map_2d.png'")
-    plt.show()
+    # plt.show()
 
 def generate_shooting_plan(detected_zones):
     shooting_plan = {}

@@ -16,7 +16,8 @@ from config import (
     KNOWN_TAGS, TAG_COLORS, ARENA_BOUNDS,
     HD_DETECTION_ZONES as DETECTION_ZONES,
     CAM_FRONT, TAG_SIZE_M,
-    HD_RESOLUTION, HD_FPS, HD_CAM_PARAMS, HD_CROP_TOP as CROP_TOP_PERCENT,
+    HD_RESOLUTION, HD_FPS, HD_CAM_PARAMS, HD_CAM_DIST_COEFFS,
+    HD_CROP_TOP as CROP_TOP_PERCENT,
     HD_CROP_BOT as CROP_BOTTOM_PERCENT,
     HD_MAX_TAG_DIST as MAX_TAG_DISTANCE,
     HD_OUT_OF_BOUNDS as OUT_OF_BOUNDS_LEEWAY,
@@ -32,6 +33,11 @@ from config import (
     TELEMETRY_PORT, MOVEMENT_HOST, MOVEMENT_CMD_PORT,
     MOVE_DEAD_MM, ROT_DEAD_DEG,
 )
+# VISION_CMD_PORT may not exist in older config files — default to 5007
+try:
+    from config import VISION_CMD_PORT
+except ImportError:
+    VISION_CMD_PORT = 5007
 from tracking import (
     get_global_camera_pose,
     apply_cam_offset,
@@ -39,6 +45,26 @@ from tracking import (
     compute_line_intersections,
 )
 from movement_client import MovementClient, compute_move_cmd
+
+# ── Load position calibration (written by calibrate_position.py) ─────────────
+# calibration.json lives in the project root (one level up from this file).
+# If absent or invalid, identity transform is used (no correction).
+_CAL_FILE = os.path.join(os.path.dirname(__file__), "..", "calibration.json")
+_CAL = {"scale_x": 1.0, "offset_x_m": 0.0,
+        "scale_y": 1.0, "offset_y_m": 0.0,
+        "heading_scale": 1.0, "heading_offset_deg": 0.0}
+try:
+    with open(_CAL_FILE) as _f:
+        _loaded = json.load(_f)
+        _CAL.update({k: _loaded[k] for k in _CAL if k in _loaded})
+    print(f"[new_main3] Calibration loaded from {_CAL_FILE}")
+    print(f"  X: scale={_CAL['scale_x']:.4f}  offset={_CAL['offset_x_m']*1000:+.1f}mm")
+    print(f"  Y: scale={_CAL['scale_y']:.4f}  offset={_CAL['offset_y_m']*1000:+.1f}mm")
+    print(f"  Heading: scale={_CAL['heading_scale']:.6f}  offset={_CAL['heading_offset_deg']:+.4f}°")
+except FileNotFoundError:
+    print("[new_main3] No calibration.json found — using raw tracker values.")
+except Exception as _e:
+    print(f"[new_main3] calibration.json load error: {_e} — using raw values.")
 
 arena_w_meters = ARENA_BOUNDS[2] - ARENA_BOUNDS[0]
 arena_h_meters = ARENA_BOUNDS[3] - ARENA_BOUNDS[1]
@@ -82,6 +108,12 @@ def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     TARGET_IP, TARGET_PORT = "127.0.0.1", TELEMETRY_PORT
 
+    # Command socket — mission_controller sends {"cmd":"scan"} here,
+    # new_main3 handles it using its own open camera handle.
+    cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cmd_sock.bind(("0.0.0.0", VISION_CMD_PORT))
+    cmd_sock.setblocking(False)   # non-blocking: checked every frame, never waits
+
     # Movement client — sends drive commands to movement_server.py
     mc = MovementClient()
 
@@ -98,6 +130,19 @@ def main():
         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         scale_factor = actual_h / 1080.0
         camera_params = [p * scale_factor for p in HD_CAM_PARAMS]
+
+        # ── HD undistortion map (built once, applied every frame) ────────────
+        # If HD_CAM_DIST_COEFFS is None, undistortion is skipped (fastest path).
+        import numpy as _np
+        if HD_CAM_DIST_COEFFS is not None:
+            _fx, _fy, _cx, _cy = camera_params
+            _cam_mtx = _np.array([[_fx, 0, _cx], [0, _fy, _cy], [0, 0, 1]], dtype=_np.float64)
+            _hd_map1, _hd_map2 = cv2.initUndistortRectifyMap(
+                _cam_mtx, HD_CAM_DIST_COEFFS, None, _cam_mtx,
+                (actual_w, actual_h), cv2.CV_16SC2
+            )
+        else:
+            _hd_map1, _hd_map2 = None, None
 
         scale_x = actual_w / 1920.0
         scale_y = actual_h / 1080.0
@@ -117,6 +162,7 @@ def main():
         quit_requested = False  # propagate 'q' out of the inner loop
         _frame_count = 0        # for DETECT_EVERY_N_FRAMES skipping
         debug_tag_estimates = []  # holds last detection result; reused on skip frames
+        raw_circle_estimates = [] # distance-only filtered; used for circle intersection viz
 
         # ---- INNER FRAME LOOP ----
         while True:
@@ -127,6 +173,10 @@ def main():
             # Brightness compensation for manual low-exposure setting
             if HD_BRIGHTNESS_BOOST != 1.0:
                 frame = cv2.convertScaleAbs(frame, alpha=HD_BRIGHTNESS_BOOST)
+
+            # Apply HD lens undistortion if coefficients are configured
+            if _hd_map1 is not None:
+                frame = cv2.remap(frame, _hd_map1, _hd_map2, cv2.INTER_LINEAR)
 
             # Keep a pristine, un-drawn-on frame for the scanner
             clean_frame = frame.copy()
@@ -169,8 +219,9 @@ def main():
                 adj_camera_params = [camera_params[0], camera_params[1], camera_params[2], camera_params[3] - y_start]
                 tags = detector.detect(gray_cropped, estimate_tag_pose=True, camera_params=adj_camera_params, tag_size=tag_size_meters)
                 debug_tag_estimates = []   # fresh results this frame
+                raw_circle_estimates = []  # fresh raw list (distance-only filtered)
             else:
-                tags = []   # skip detection; keep previous debug_tag_estimates for display
+                tags = []   # skip detection; keep previous lists for display
 
             for tag in tags:
                 tag.corners[:, 1] += y_start
@@ -195,11 +246,23 @@ def main():
                     # Apply camera-to-robot offset
                     robot_x, robot_y = apply_cam_offset(cam_x, cam_y, gdx, gdy,
                                                          HD_CAM_FORWARD_M, HD_CAM_SIDEWAYS_M)
-                    # Reject out-of-bounds estimates
+
+                    # ── Raw entry for circle intersection ─────────────────
+                    # Distance is reliable regardless of pose quality, so we keep
+                    # ALL distance-valid tags here even if the pose is rejected below.
+                    # The circle intersection only uses tag world position + distance,
+                    # not the estimated camera pose.
+                    raw_circle_estimates.append({
+                        "id": tag.tag_id, "dist": dist,
+                        # pose field needed by compute_distance_circles for the
+                        # tag-to-camera direction used in weight calculation only
+                        "pose": (robot_x, robot_y, gdx, gdy),
+                    })
+
+                    # ── Pose-based entry — apply bounds + jump filter ──────
                     if not (ARENA_BOUNDS[0] - OUT_OF_BOUNDS_LEEWAY <= robot_x <= ARENA_BOUNDS[2] + OUT_OF_BOUNDS_LEEWAY and
                             ARENA_BOUNDS[1] - OUT_OF_BOUNDS_LEEWAY <= robot_y <= ARENA_BOUNDS[3] + OUT_OF_BOUNDS_LEEWAY):
                         continue
-                    # Reject implausible jumps when already tracking
                     if initialized and math.hypot(robot_x - last_x, robot_y - last_y) > MAX_POSE_JUMP:
                         continue
                     robot_pose = (robot_x, robot_y, gdx, gdy)
@@ -221,10 +284,21 @@ def main():
                     raw_avg_x, raw_avg_y, raw_avg_dx, raw_avg_dy, sum_distances, n = fused
 
                     # ── Circle-intersection extra estimate ─────────────────
-                    isect = compute_line_intersections(debug_tag_estimates)
+                    # Uses raw_circle_estimates (distance-only filtered) so that
+                    # tags excluded by the pose bounds/jump filter still contribute
+                    # to the distance-based circle intersection — distance is stable
+                    # even when the pose estimate is unreliable.
+                    isect = compute_line_intersections(raw_circle_estimates)
                     if isect and LINE_INTERSECT_BLEND > 0:
                         raw_avg_x = (1-LINE_INTERSECT_BLEND)*raw_avg_x + LINE_INTERSECT_BLEND*isect[0]
                         raw_avg_y = (1-LINE_INTERSECT_BLEND)*raw_avg_y + LINE_INTERSECT_BLEND*isect[1]
+
+                    # ── Apply calibration to raw value BEFORE smoothing ────
+                    # MUST be here. If applied to last_x/last_y after the filter,
+                    # the scale factor multiplies itself every frame → drift.
+                    # e.g. scale_y=1.02: frame1→2.4265, frame2→2.4781, → runaway.
+                    raw_avg_x = _CAL["scale_x"] * raw_avg_x + _CAL["offset_x_m"]
+                    raw_avg_y = _CAL["scale_y"] * raw_avg_y + _CAL["offset_y_m"]
 
                     history_raw_x.append(raw_avg_x); history_raw_y.append(raw_avg_y)
                     if not initialized:
@@ -253,7 +327,14 @@ def main():
                     
                     mag_smooth = math.sqrt(last_dx**2 + last_dy**2)
                     if mag_smooth > 0: last_dx /= mag_smooth; last_dy /= mag_smooth
-                    
+
+                    # Heading: apply scale then offset — safe after smoothing
+                    if _CAL["heading_scale"] != 1.0 or _CAL["heading_offset_deg"] != 0.0:
+                        _h_raw = math.degrees(math.atan2(last_dy, last_dx)) % 360
+                        _h_cal = (_CAL["heading_scale"] * _h_raw + _CAL["heading_offset_deg"]) % 360
+                        last_dx = math.cos(math.radians(_h_cal))
+                        last_dy = math.sin(math.radians(_h_cal))
+
                     text_color = (0, 255, 0)
             else:
                 if initialized and (time.time() - last_seen_time > TRACKING_TIMEOUT):
@@ -304,6 +385,47 @@ def main():
 
             # --- STATE MACHINE UI & KEYBINDS ---
             key = cv2.waitKey(1) & 0xFF
+
+            # ── Check for remote commands from mission_controller ──────────
+            # Non-blocking: if no command waiting, continues immediately.
+            try:
+                raw_cmd, cmd_addr = cmd_sock.recvfrom(1024)
+                msg = json.loads(raw_cmd.decode())
+                if msg.get("cmd") == "scan":
+                    # Treat exactly like pressing 's' — use already-captured frame
+                    print("[CMD] Remote scan triggered by mission_controller")
+                    cv2.imwrite("current_scan.jpg", clean_frame)
+                    subprocess.run([sys.executable, "snooker_planner.py", "current_scan.jpg"])
+                    if os.path.exists("robot_shooting_plan.json"):
+                        with open("robot_shooting_plan.json", "r") as f:
+                            shooting_plans = json.load(f)
+                        APP_STATE = "AIMING"
+                        print(f"[CMD] Scan done. Plans: {list(shooting_plans.keys())}")
+                    else:
+                        print("[CMD] Scan done. No plan generated.")
+                    # Reply so do_scan() knows it's finished
+                    cmd_sock.sendto(json.dumps({"status": "done"}).encode(), cmd_addr)
+
+                elif msg.get("cmd") == "confirm_shot":
+                    # Treat exactly like pressing 'c' — release camera, run sniper,
+                    # reply when sniper exits so mission_controller knows it's done.
+                    target_data = msg.get("target_data", {})
+                    print(f"[CMD] confirm_shot received for zone {target_data.get('target_ball_zone','?')}")
+                    with open("selected_target.json", "w") as _sf:
+                        json.dump(target_data, _sf)
+                    print("Shot Confirmed! Releasing HD camera → handing to 4K Sniper...")
+                    cap.release()
+                    cv2.destroyAllWindows()
+                    subprocess.run([sys.executable, "sniper_4k.py"])
+                    # Sniper exited — reply to mission_controller
+                    cmd_sock.sendto(json.dumps({"status": "sniper_done"}).encode(), cmd_addr)
+                    print("[HD Navigator] Sniper exited. Restarting in DRIVING mode...")
+                    break   # break inner loop → outer loop re-opens HD camera
+
+            except BlockingIOError:
+                pass   # no command waiting — normal path every frame
+            except Exception as _cmd_e:
+                print(f"[CMD] command error: {_cmd_e}")
             
             if APP_STATE == "DRIVING":
                 cv2.putText(frame, "STATE: DRIVING. Press 's' to Scan Targets", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
@@ -406,18 +528,20 @@ def main():
                     pt_arrow_end = world_to_pixel(pose[0] + pose[2] * arrow_length, pose[1] + pose[3] * arrow_length)
                     cv2.arrowedLine(map_canvas, pt_cam_pred, pt_arrow_end, color, 1, tipLength=0.25)
 
-            # ── Line-intersection rays (dashed white — distinguishable from above) ──
-            isect_viz = compute_line_intersections(debug_tag_estimates)
+            # ── Circle-intersection rays (dashed grey — distance-based, wider filter) ──
+            # Uses raw_circle_estimates so tags excluded from pose tracking due to
+            # bounds/jump checks still show their distance circles here.
+            # Distance is stable and doesn't need the same strict filtering as pose.
+            isect_viz = compute_line_intersections(raw_circle_estimates)
             if isect_viz:
                 isect_pt = world_to_pixel(isect_viz[0], isect_viz[1])
                 cv2.circle(map_canvas, isect_pt, 6, (255, 255, 255), 2)   # white ring
-                # Draw rays from each tag toward the intersection point
-                for entry in debug_tag_estimates:
+                # Dashed lines from each tag (raw list) toward intersection point
+                for entry in raw_circle_estimates:
                     tid = entry["id"]
                     if tid in KNOWN_TAGS:
                         ti = KNOWN_TAGS[tid]
                         pt_tag = world_to_pixel(ti["x"], ti["y"])
-                        # Dashed line: draw short segments
                         x0, y0 = pt_tag; x1, y1 = isect_pt
                         steps = max(1, int(math.hypot(x1-x0, y1-y0) / 8))
                         for s in range(0, steps, 2):

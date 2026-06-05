@@ -4,6 +4,19 @@ import os
 import sys
 import time
 
+# ── Import all settings from central config ──────────────────────────────────
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from config import (
+    CAM_FRONT,       # HD camera used for scanning (same device as tracking)
+    HD_SCAN_RESOLUTION,
+    HD_DETECTION_ZONES,
+    HD_BALL_RED_LO1, HD_BALL_RED_HI1,
+    HD_BALL_RED_LO2, HD_BALL_RED_HI2,
+    HD_BALL_BLUE_LO, HD_BALL_BLUE_HI,
+    HD_BALL_WHITE_LO, HD_BALL_WHITE_HI,
+    HD_BALL_PERCENT_THRESHOLD,
+)
+
 def detect_balls_in_zones(image_path = None, waitkey = 1):
     if image_path: # Load the image
         img = cv2.imread(image_path)
@@ -13,15 +26,15 @@ def detect_balls_in_zones(image_path = None, waitkey = 1):
     else: # capture with camera
         # 1. Platform-Specific Camera Initialization
         if sys.platform.startswith('win'):
-            cap = cv2.VideoCapture(2, cv2.CAP_DSHOW)
+            cap = cv2.VideoCapture(CAM_FRONT, cv2.CAP_DSHOW)
         else:
-            cap = cv2.VideoCapture(2, cv2.CAP_V4L2) # Best for Raspberry Pi / Linux
+            cap = cv2.VideoCapture(CAM_FRONT, cv2.CAP_V4L2)
 
         if not cap.isOpened():
             raise IOError("Webcam could not be opened.")
-        
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  HD_SCAN_RESOLUTION[0])
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HD_SCAN_RESOLUTION[1])
 
         # Camera Warm-up Loop
         for _ in range(5):
@@ -45,36 +58,29 @@ def detect_balls_in_zones(image_path = None, waitkey = 1):
         cv2.imwrite(save_path, img)
         print(f"Photo captured and saved as: {save_path}")
         
-    # 2. Define Regions of Interest (ROIs)
+    # 2. Define Regions of Interest (ROIs) — from config.py
+    # Zones defined at 1080p in config; scale to actual image resolution
+    img_h, img_w = img.shape[:2]
+    scale_x = img_w / 1920.0
+    scale_y = img_h / 1080.0
     zones = {
-        "B": (360, 560, 170, 170),
-        "C": (610, 500, 130, 130),
-        "D": (790, 500, 130, 130),
-        "E": (960, 520, 130, 130),
-        "F": (1130, 500, 130, 130),
-        "G": (1320, 500, 130, 130),
-        "A": (1550, 560, 170, 170),
+        name: [int(x*scale_x), int(y*scale_y), int(w*scale_x), int(h*scale_y)]
+        for name, (x, y, w, h) in HD_DETECTION_ZONES.items()
     }
-
-    for zone, region in zones.items(): # change as set / dont change
-        zones[zone] = [int(x * (1080.0/1080.0)) for x in region]
 
     # 3. Convert image to HSV
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    # 4. Define Color Thresholds
-    lower_red1 = np.array([0, 50, 20])
-    upper_red1 = np.array([15, 255, 255])
-    lower_red2 = np.array([165, 50, 20])
-    upper_red2 = np.array([180, 255, 255])
-    
-    lower_blue = np.array([95, 50, 30])
-    upper_blue = np.array([150, 255, 255])
-
-    lower_white = np.array([180, 75, 255]) 
-    upper_white = np.array([180, 75, 255])
-
-    PERCENT_THRESHOLD = 0.05
+    # 4. Define Color Thresholds — from config.py
+    lower_red1 = np.array(HD_BALL_RED_LO1)
+    upper_red1 = np.array(HD_BALL_RED_HI1)
+    lower_red2 = np.array(HD_BALL_RED_LO2)
+    upper_red2 = np.array(HD_BALL_RED_HI2)
+    lower_blue  = np.array(HD_BALL_BLUE_LO)
+    upper_blue  = np.array(HD_BALL_BLUE_HI)
+    lower_white = np.array(HD_BALL_WHITE_LO)
+    upper_white = np.array(HD_BALL_WHITE_HI)
+    PERCENT_THRESHOLD = HD_BALL_PERCENT_THRESHOLD
 
     # Generate global masks for debugging
     mask_red1 = cv2.inRange(hsv, lower_red1, upper_red1)
@@ -159,19 +165,19 @@ def detect_balls_in_zones(image_path = None, waitkey = 1):
 
     # Note: When running autonomously on the actual robot, you can comment these out
     # so the robot code doesn't freeze waiting for you to press a key.
-    camera_name = "1. Snooker Bot Vision - Results"
-    combined_name = "2. Debug - Combined Pure Masks"
-    debug_name = "3. Debug - Translucent Overlay"
-    cv2.namedWindow(camera_name, cv2.WINDOW_NORMAL)
-    cv2.namedWindow(combined_name, cv2.WINDOW_NORMAL)
-    cv2.namedWindow(debug_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(camera_name, 800, 450)
-    cv2.resizeWindow(combined_name, 800, 450)
-    cv2.resizeWindow(debug_name, 800, 450)
-    cv2.imshow(camera_name, output_img)
-    cv2.imshow(combined_name, debug_masks_img)
-    cv2.imshow(debug_name, debug_overlay_img)
-    cv2.waitKey(waitkey)
+    # camera_name = "1. Snooker Bot Vision - Results"
+    # combined_name = "2. Debug - Combined Pure Masks"
+    # debug_name = "3. Debug - Translucent Overlay"
+    # cv2.namedWindow(camera_name, cv2.WINDOW_NORMAL)
+    # cv2.namedWindow(combined_name, cv2.WINDOW_NORMAL)
+    # cv2.namedWindow(debug_name, cv2.WINDOW_NORMAL)
+    # cv2.resizeWindow(camera_name, 800, 450)
+    # cv2.resizeWindow(combined_name, 800, 450)
+    # cv2.resizeWindow(debug_name, 800, 450)
+    # cv2.imshow(camera_name, output_img)
+    # cv2.imshow(combined_name, debug_masks_img)
+    # cv2.imshow(debug_name, debug_overlay_img)
+    # cv2.waitKey(waitkey)
 
     return detected_results  # <--- THIS MAKES INTEGRATION WORK!
 

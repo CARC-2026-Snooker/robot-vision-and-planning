@@ -2,134 +2,112 @@ import cv2
 import json
 import math
 import sys
+import os
 import time
 import threading
+import socket
 import numpy as np
 from collections import deque
 from pupil_apriltags import Detector
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TAG / POCKET DEFINITIONS
-# ─────────────────────────────────────────────────────────────────────────────
-POCKET_TO_TAG = {
-    "Hole_3": 3, "Hole_4": 4, "Hole_5": 5, "Hole_2": 2, "Hole_1": 1
-}
-POCKETS_XY = {
-    "Hole_3": (0, 0), "Hole_4": (600, 0), "Hole_5": (1200, 0),
-    "Hole_2": (0, 1050), "Hole_1": (1200, 1050)
-}
-KNOWN_TAGS = {
-    1: {"x": 1.262, "y": 1.05, "facing_angle": 270},
-    2: {"x": -0.062, "y": 1.05, "facing_angle": 270},
-    3: {"x": 0,   "y": 0,    "facing_angle": 270},
-    4: {"x": 0.6, "y": 0,    "facing_angle": 270},
-    5: {"x": 1.2, "y": 0,    "facing_angle": 270},
-}
-TAG_COLORS = {
-    1: (255, 105, 180),
-    2: (0, 255, 255),
-    3: (0, 165, 255),
-    4: (255, 255, 0),
-    5: (255, 0, 255),
-}
+# ── Import all settings from central config ──────────────────────────────────
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from config import (
+    # Field / tags / pockets
+    KNOWN_TAGS, TAG_COLORS, ARENA_BOUNDS,
+    POCKETS_MM as POCKETS_XY,
+    POCKET_TO_TAG,
+    TAG_SIZE_M,
+    # Camera hardware — user has renamed these to named device paths
+    CAM_FRONT,          # HD tracking camera (rear-facing wide view)
+    CAM_4K,                      # 4K sniper camera
+    HD_RESOLUTION, HD_FPS, HD_CAM_PARAMS,
+    CAM_4K_RESOLUTION, CAM_4K_PARAMS, CAM_4K_DIST_COEFFS,
+    HD_CAM_FORWARD_M, HD_CAM_SIDEWAYS_M,
+    # HD tracking thresholds
+    HD_MAX_TAG_DIST as MAX_TAG_DISTANCE,
+    HD_OUT_OF_BOUNDS as OUT_OF_BOUNDS_LEEWAY,
+    HD_MAX_POSE_JUMP as MAX_POSE_JUMP,
+    HD_TRACKING_TIMEOUT as TRACKING_TIMEOUT,
+    HD_CROP_TOP as CROP_TOP_PCT,
+    HD_CROP_BOT as CROP_BOT_PCT,
+    HD_HISTORY_LEN,
+    # Sniper-mode tracking thresholds (tighter than driving — robot is stationary)
+    SN_STILL_THR  as BASE_STILL_THRESHOLD,
+    SN_MOVE_THR   as BASE_MOVE_THRESHOLD,
+    SN_STILL_ALPHA as STILL_ALPHA,
+    SN_MOVE_ALPHA  as MOVE_ALPHA,
+    HD_CONSENSUS_SIGMA as CONSENSUS_SIGMA,
+    # Performance
+    DETECT_EVERY_N_FRAMES,
+    HD_BRIGHTNESS_BOOST,
+    # Shot geometry
+    SHOT_STRAIGHT_THR as STRAIGHT_THRESHOLD,
+    CORNER_OFFSET_MM,
+    ANGLE_LOCK_DEG,
+    # Ball detection / 4K overlay
+    CAM_4K_BALL_RED, CAM_4K_BALL_BLUE,
+    LATERAL_TOL_PX,
+    # Map display
+    MAP_SCALE as SCALE, MAP_PADDING as PADDING,
+    # Network — for telemetry broadcast
+    TELEMETRY_PORT,
+)
+from tracking import get_global_camera_pose, apply_cam_offset
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MAP CONSTANTS  (identical to new_main3.py)
-# ─────────────────────────────────────────────────────────────────────────────
-ARENA_BOUNDS  = (0.0, 0.0, 1.2, 3.6)
-SCALE         = 200
-PADDING       = 60
+# ── Derived constants ─────────────────────────────────────────────────────────
 CANVAS_W = int((ARENA_BOUNDS[2] - ARENA_BOUNDS[0]) * SCALE) + 2 * PADDING
 CANVAS_H = int((ARENA_BOUNDS[3] - ARENA_BOUNDS[1]) * SCALE) + 2 * PADDING
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HD TRACKING CONSTANTS  (same as new_main3.py — tuned for position)
-# ─────────────────────────────────────────────────────────────────────────────
-MAX_TAG_DISTANCE    = 10.0
-OUT_OF_BOUNDS_LEEWAY = 0.15
-MAX_POSE_JUMP       = 0.5
-TRACKING_TIMEOUT    = 0.3
-CROP_TOP_PCT        = 0.20
-CROP_BOT_PCT        = 0.20
-
-# Sniper-mode thresholds — slightly tighter than driving because we're stationary
-BASE_STILL_THRESHOLD = 0.005   # was 0.005 in new_main3 — sniper is closer/stationary
-BASE_MOVE_THRESHOLD  = 0.020   # was 0.030
-STILL_ALPHA          = 0.005   # same
-MOVE_ALPHA           = 0.30    # slightly faster than 0.25 so it follows when pushed
-
-# Consensus weighting: same as new_main3.py — see comments there
-CONSENSUS_SIGMA = 0.045   # 45mm soft-rejection radius for outlier tag estimates
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CAMERA-TO-ROBOT CENTRE OFFSET
-# The HD camera lens is 5cm FORWARD of the robot centre.
-# get_global_camera_pose() returns the camera optical centre.
-# Subtract this offset along the heading to get the true robot centre.
-# The 4K camera's forward offset (20cm) does NOT need correction here:
-# atan2(t_x, t_z) measures direction in camera frame, which is independent
-# of where the lens sits — only the heading matters, not the absolute position.
-# ─────────────────────────────────────────────────────────────────────────────
-HD_CAM_FORWARD_M = 0.05   # metres — HD lens is this far forward of robot centre
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RASPBERRY PI PERFORMANCE (HD tracking loop)
-# ─────────────────────────────────────────────────────────────────────────────
-DETECT_EVERY_N_FRAMES = 1    # run AprilTag detection every N HD frames
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SHOT MODE
-# Balls A, B, E have a 0° cut angle — the robot fires in a straight line through
-# the ghost ball and into the pocket. For these shots, when the 4K angle
-# correction = 0, the robot is ALSO at the correct X position (proven by
-# geometry: any X shift changes the angle to the pocket tag). The HD X/Y
-# measurement is therefore redundant and noisier than the 4K angle. We skip it.
-#
-# For all other balls (cut angle > threshold), the HD X/Y IS needed — the robot
-# could have the right angle to the tag but be at the wrong X position.
-# ─────────────────────────────────────────────────────────────────────────────
-STRAIGHT_THRESHOLD = 5.0   # degrees — below this, use straight-line mode
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TUNABLE PARAMETERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Corner pocket offset — STRAIGHT shots at Hole_3 (left) and Hole_5 (right) only.
-# Shooting from a shallow angle into a corner risks clipping the side wall.
-# This shifts the target alignment point away from the tag center toward the
-# open part of the pocket.
-#   Hole_3 (left corner)  → offset to the RIGHT  (+)
-#   Hole_5 (right corner) → offset to the LEFT   (-)
-# Units: mm.  Set to 0 to disable.
-CORNER_OFFSET_MM = 25.0   # 0 to ~50mm typical range
-
-# Pixel tolerance for lateral lock (at full camera resolution).
-# ~2–7mm accuracy depending on shot geometry.
-LATERAL_TOL_PX = 10
-
-# Exposure brightness compensation.
-# When manual exposure is set very low to reduce motion blur, the image gets dark.
-# This multiplier is applied to every captured HD frame before display and tracking.
-# 1.0 = no change. 1.5–2.5 = typical useful range for low-exposure compensation.
-# Also applied in new_main3.py via the same constant name (keep them in sync).
-# HD_BRIGHTNESS_BOOST = 1.8   # adjust to taste
-HD_BRIGHTNESS_BOOST = 1.0   # adjust to taste
+# Ball HSV lookup — maps "Red"/"Blue" to range lists from config
 BALL_HSV = {
-    "Red":  [(np.array([0, 50, 20]),   np.array([15, 255, 255])),
-             (np.array([165, 50, 20]), np.array([180, 255, 255]))],
-    "Blue": [(np.array([65, 10, 10]),  np.array([170, 255, 255]))],
-    # "Blue": [(np.array([80, 20, 10]),  np.array([170, 255, 255]))],
+    "Red":  CAM_4K_BALL_RED,
+    "Blue": CAM_4K_BALL_BLUE,
 }
+DIST_COEFFS = CAM_4K_DIST_COEFFS
+
+# ── Load position calibration (same file as new_main3.py) ────────────────────
+# calibration.json is one level up (Carc2026/ root). If absent, identity used.
+_CAL_FILE = os.path.join(os.path.dirname(__file__), "..", "calibration.json")
+_CAL = {
+    "scale_x": 1.0, "offset_x_m": 0.0,
+    "scale_y": 1.0, "offset_y_m": 0.0,
+    "heading_idw_points": [],
+    "heading_idw_power": 2,
+    "heading_idw_fallback_deg": 0.0,
+}
+try:
+    with open(_CAL_FILE) as _f:
+        _loaded = json.load(_f)
+        _CAL.update({k: _loaded[k] for k in _CAL if k in _loaded})
+    print(f"[Sniper] Calibration loaded: "
+          f"X scale={_CAL['scale_x']:.4f} offset={_CAL['offset_x_m']*1000:+.1f}mm  "
+          f"Y scale={_CAL['scale_y']:.4f} offset={_CAL['offset_y_m']*1000:+.1f}mm  "
+          f"heading IDW {len(_CAL['heading_idw_points'])} pts")
+except FileNotFoundError:
+    print("[Sniper] No calibration.json — using raw tracker values.")
+except Exception as _e:
+    print(f"[Sniper] calibration.json load error: {_e} — using raw values.")
+
+
+def _idw_heading_correction(x_m: float, y_m: float) -> float:
+    """Position-dependent heading correction via IDW — identical to new_main3."""
+    pts = _CAL["heading_idw_points"]
+    if not pts:
+        return _CAL["heading_idw_fallback_deg"]
+    x_mm = x_m * 1000.0;  y_mm = y_m * 1000.0
+    power = _CAL["heading_idw_power"]
+    eps   = 10.0 ** 2
+    total_w = total_c = 0.0
+    for p in pts:
+        d2 = (x_mm - p["x_mm"])**2 + (y_mm - p["y_mm"])**2
+        w  = 1.0 / (d2 + eps) ** power
+        total_w += w
+        total_c += w * p["correction_deg"]
+    return total_c / total_w
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4K ANGLE THREAD CONSTANTS
-# Camera matrix from calibration script — verified values
-# ─────────────────────────────────────────────────────────────────────────────
-# Distortion coefficients from calibration
-DIST_COEFFS = np.array([[-1.23467127e+00, 1.37940482e+01, -2.47010796e-02, 6.62621201e-03, -1.51346017e+02]])
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS
+# MAP HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def world_to_pixel(x, y):
     px = int((x - ARENA_BOUNDS[0]) * SCALE) + PADDING
@@ -139,20 +117,7 @@ def world_to_pixel(x, y):
 def draw_map_line(canvas, x1, y1, x2, y2, color=(255, 255, 255), thickness=2):
     cv2.line(canvas, world_to_pixel(x1, y1), world_to_pixel(x2, y2), color, thickness)
 
-def get_global_camera_pose(tag_id, t, R):
-    """Identical to new_main3.py — do not modify."""
-    if tag_id not in KNOWN_TAGS: return None
-    cam_pos_in_tag_frame = -np.transpose(R) @ t
-    local_x = cam_pos_in_tag_frame[0][0]
-    local_z = cam_pos_in_tag_frame[2][0]
-    tag_info = KNOWN_TAGS[tag_id]
-    theta = math.radians(tag_info["facing_angle"])
-    gx = tag_info["x"] + (local_z * math.cos(theta)) - (local_x * math.sin(theta))
-    gy = tag_info["y"] + (local_z * math.sin(theta)) + (local_x * math.cos(theta))
-    tag_space_dx, tag_space_dz = R[2, 0], R[2, 2]
-    gdx = (tag_space_dz * math.cos(theta)) - (tag_space_dx * math.sin(theta))
-    gdy = (tag_space_dz * math.sin(theta)) + (tag_space_dx * math.cos(theta))
-    return (gx, gy, gdx, gdy)
+# get_global_camera_pose and apply_cam_offset imported from tracking.py
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -179,27 +144,22 @@ class Sniper4kThread(threading.Thread):
 
         self.running  = True
         self.detector = Detector(families="tag36h11")
+        self.tag_size = TAG_SIZE_M
 
         if sys.platform.startswith('win'):
-            self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            self.cap = cv2.VideoCapture(CAM_4K, cv2.CAP_DSHOW)
         else:
-            self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  3840)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
-        # self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  2560)
-        # self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1440)
-        # self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
-        # self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+            self.cap = cv2.VideoCapture(CAM_4K, cv2.CAP_V4L2)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_4K_RESOLUTION[0])
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_4K_RESOLUTION[1])
 
         # Read actual delivered resolution so params scale correctly
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self._actual_w = actual_w
         self._actual_h = actual_h
-        # base_4k  = [6280.83, 6558.89, 811.37, 499.18]
-        base_4k  = [4534.22, 4528.08, 979.27, 775.85]
         scale    = actual_h / 1080.0
-        self.camera_params_4k = [p * scale for p in base_4k]
+        self.camera_params_4k = [p * scale for p in CAM_4K_PARAMS]
 
         # Build undistort map once at actual resolution
         fx, fy, cx, cy = self.camera_params_4k
@@ -317,8 +277,8 @@ class Sniper4kThread(threading.Thread):
             # ── Downscale to half-res for display ────────────────────────
             # Use actual_w//2 × actual_h//2 so the window fits correctly at
             # any capture resolution (1080p, 1440p, 4K, etc.)
-            disp_w = self._actual_w // 2
-            disp_h = self._actual_h // 2
+            disp_w = self._actual_w // 4
+            disp_h = self._actual_h // 4
             frame_small = cv2.resize(draw_frame, (disp_w, disp_h))
             self._disp_w = disp_w
             self._disp_h = disp_h
@@ -430,35 +390,30 @@ def main():
 
     # ── HD camera (position — 30fps) ─────────────────────────────────────────
     if sys.platform.startswith('win'):
-        cap_hd = cv2.VideoCapture(2, cv2.CAP_DSHOW)
+        cap_hd = cv2.VideoCapture(CAM_FRONT, cv2.CAP_DSHOW)
     else:
-        cap_hd = cv2.VideoCapture(2, cv2.CAP_V4L2)
+        cap_hd = cv2.VideoCapture(CAM_FRONT, cv2.CAP_V4L2)
     cap_hd.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-    cap_hd.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
-    cap_hd.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    cap_hd.set(cv2.CAP_PROP_FRAME_WIDTH,  HD_RESOLUTION[0])
+    cap_hd.set(cv2.CAP_PROP_FRAME_HEIGHT, HD_RESOLUTION[1])
     cap_hd.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap_hd.set(cv2.CAP_PROP_FPS, 30)
+    cap_hd.set(cv2.CAP_PROP_FPS, HD_FPS)
     cap_hd.set(cv2.CAP_PROP_AUTOFOCUS, 0)
 
-    # setting exposure manually so less blur on movement
-    # cap_hd.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1.0) 
-    # cap_hd.set(cv2.CAP_PROP_EXPOSURE, -4.0) # Try values between -1 and -9 
     for _ in range(5):
         cap_hd.read()
         time.sleep(0.05)
 
-    actual_h_hd  = int(cap_hd.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    base_hd = [1996.94*0.99444, 1998.60*0.99444, 827.66, 460.60]
-    # base_hd = [1924.70, 1924.67, 907.46, 483.50]
-    scale_hd     = actual_h_hd / 1080.0
-    camera_params_hd = [p * scale_hd for p in base_hd]
+    actual_h_hd      = int(cap_hd.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    scale_hd         = actual_h_hd / 1080.0
+    camera_params_hd = [p * scale_hd for p in HD_CAM_PARAMS]
 
     detector_hd = Detector(families="tag36h11")
-    tag_size_hd = 0.11
+    tag_size_hd = TAG_SIZE_M
 
     # ── Position tracking state (mirrors new_main3.py exactly) ──────────────
-    history_raw_x = deque(maxlen=15)
-    history_raw_y = deque(maxlen=15)
+    history_raw_x = deque(maxlen=HD_HISTORY_LEN)
+    history_raw_y = deque(maxlen=HD_HISTORY_LEN)
     last_x, last_y, last_dx, last_dy = 0.0, 0.0, 1.0, 0.0
     initialized    = False
     last_seen_time = time.time()
@@ -471,6 +426,11 @@ def main():
     print(f"[Sniper] Target angle  : {target_relative_angle:.2f}°")
     print(f"[Sniper] HD cam  → position (X, Y, heading) at 30fps")
     print(f"[Sniper] 4K cam  → angle correction (threaded, non-blocking)")
+
+    # ── Telemetry broadcast socket (same port as new_main3 — mission_controller ──
+    # listens here while sniper is active).  Uses the same packet format as
+    # new_main3, extended with sniper-specific fields so SniperState works.
+    _telem_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     _hd_frame_count  = 0
     debug_tag_estimates = []   # persists across skipped frames
@@ -512,14 +472,18 @@ def main():
             if pose is None: continue
             dist = math.sqrt(t[0][0]**2 + t[1][0]**2 + t[2][0]**2)
             if dist > MAX_TAG_DISTANCE: continue
-            gx, gy = pose[0], pose[1]
-            if not (ARENA_BOUNDS[0] - OUT_OF_BOUNDS_LEEWAY <= gx <= ARENA_BOUNDS[2] + OUT_OF_BOUNDS_LEEWAY and
-                    ARENA_BOUNDS[1] - OUT_OF_BOUNDS_LEEWAY <= gy <= ARENA_BOUNDS[3] + OUT_OF_BOUNDS_LEEWAY):
+            cam_x, cam_y, gdx, gdy = pose
+            # Apply camera-to-robot-centre offset
+            robot_x, robot_y = apply_cam_offset(cam_x, cam_y, gdx, gdy,
+                                                 HD_CAM_FORWARD_M, HD_CAM_SIDEWAYS_M)
+            if not (ARENA_BOUNDS[0] - OUT_OF_BOUNDS_LEEWAY <= robot_x <= ARENA_BOUNDS[2] + OUT_OF_BOUNDS_LEEWAY and
+                    ARENA_BOUNDS[1] - OUT_OF_BOUNDS_LEEWAY <= robot_y <= ARENA_BOUNDS[3] + OUT_OF_BOUNDS_LEEWAY):
                 continue
-            if initialized and math.hypot(gx - last_x, gy - last_y) > MAX_POSE_JUMP:
+            if initialized and math.hypot(robot_x - last_x, robot_y - last_y) > MAX_POSE_JUMP:
                 continue
+            robot_pose = (robot_x, robot_y, gdx, gdy)
             w = 1.0 / (dist**3 + 0.001)
-            debug_tag_estimates.append({"id": tag.tag_id, "pose": pose, "dist": dist, "w": w})
+            debug_tag_estimates.append({"id": tag.tag_id, "pose": robot_pose, "dist": dist, "w": w})
 
         if debug_tag_estimates:
             last_seen_time = time.time()
@@ -546,9 +510,18 @@ def main():
             mag = math.hypot(raw_dx, raw_dy)
             if mag > 0: raw_dx /= mag; raw_dy /= mag
 
-            # ── Camera-to-robot-centre offset correction ───────────────────
-            raw_x -= HD_CAM_FORWARD_M * raw_dx
-            raw_y -= HD_CAM_FORWARD_M * raw_dy
+            # ── Apply calibration BEFORE the low-pass filter ───────────────
+            # Must be here — applying after smoothing compounds the scale
+            # factor every frame and causes position drift (same bug as new_main3).
+            # X/Y scale + offset
+            raw_x  = _CAL["scale_x"] * raw_x  + _CAL["offset_x_m"]
+            raw_y  = _CAL["scale_y"] * raw_y  + _CAL["offset_y_m"]
+            # Heading IDW correction (position-dependent)
+            _raw_h  = math.degrees(math.atan2(raw_dy, raw_dx)) % 360
+            _h_corr = _idw_heading_correction(raw_x, raw_y)
+            _cal_h  = (_raw_h + _h_corr) % 360
+            raw_dx  = math.cos(math.radians(_cal_h))
+            raw_dy  = math.sin(math.radians(_cal_h))
 
             history_raw_x.append(raw_x)
             history_raw_y.append(raw_y)
@@ -606,7 +579,7 @@ def main():
             x_error = 999.0
             y_error = 999.0
 
-        ang_locked = tag_found_4k and abs(correction) < 0.3
+        ang_locked = tag_found_4k and abs(correction) < ANGLE_LOCK_DEG
 
         if SHOT_MODE == "STRAIGHT":
             # STEP 1 — ANGLE: correction ≈ 0  (TURN LEFT / TURN RIGHT)
@@ -632,6 +605,48 @@ def main():
             pos_locked = x_ok and y_ok
             lateral_mm = None
             lat_locked = False
+
+        # ════════════════════════════════════════════════════════════════════
+        # 3.5  BROADCAST SNIPER TELEMETRY
+        # Same port as new_main3 so mission_controller.RobotState (or the new
+        # SniperState class) sees live data while the sniper window is open.
+        # ════════════════════════════════════════════════════════════════════
+        _sniper_pkt = {
+            # ── Standard fields (same as new_main3 packet) ────────────────
+            "initialized":   initialized,
+            "x_mm":          round(last_x * 1000.0, 1),
+            "y_mm":          round(last_y * 1000.0, 1),
+            "heading_dx":    round(last_dx, 3),
+            "heading_dy":    round(last_dy, 3),
+            "state":         state_text,
+            "app_state":     "AIMING",
+            # ── Sniper-specific fields ─────────────────────────────────────
+            "sniper_active":     True,
+            "shot_mode":         SHOT_MODE,          # "STRAIGHT" | "CUT"
+            "target_pocket":     target_pocket,
+            "target_zone":       target_data.get("target_ball_zone", "?"),
+            "ball_color":        ball_color,
+            "tag_found_4k":      tag_found_4k,
+            # Angle correction (positive → TURN RIGHT to reduce)
+            "ang_correction_deg": round(correction, 3) if tag_found_4k else None,
+            "ang_locked":        ang_locked,
+            # Lateral error (STRAIGHT mode only; None for CUT)
+            "lateral_mm":        round(lateral_mm, 1) if lateral_mm is not None else None,
+            "lat_locked":        lat_locked,
+            # HD position errors vs plan
+            "x_error_mm":        round(x_error, 1),
+            "y_error_mm":        round(y_error, 1),
+            # Combined lock
+            "pos_locked":        pos_locked,
+            "fully_locked":      pos_locked and ang_locked,
+        }
+        try:
+            _telem_sock.sendto(
+                json.dumps(_sniper_pkt).encode(),
+                ("127.0.0.1", TELEMETRY_PORT)
+            )
+        except Exception:
+            pass
 
         # ════════════════════════════════════════════════════════════════════
         # 4. DRAW 4K VIEW  (with HUD overlaid)
@@ -904,6 +919,7 @@ def main():
 
     sniper_thread.stop()
     cap_hd.release()
+    _telem_sock.close()
     cv2.destroyAllWindows()
 
 
