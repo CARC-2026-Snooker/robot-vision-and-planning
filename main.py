@@ -3,6 +3,7 @@ import numpy as np
 import os
 import sys
 import time
+from pathlib import Path
 
 # ── Import all settings from central config ──────────────────────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -161,7 +162,18 @@ def detect_balls_in_zones(image_path = None, waitkey = 1):
 
     # Save output images
     cv2.imwrite("debug_masks_combined.png", debug_masks_img)
-    cv2.imwrite("debug_overlay.png", debug_overlay_img)
+    
+    output_dir = Path("debug_images")
+    output_dir.mkdir(exist_ok=True)
+
+    i = 1
+    while (output_dir / f"debug_overlay_{i}.png").exists():
+        i += 1
+
+    cv2.imwrite(
+        str(output_dir / f"debug_overlay_{i}.png"),
+        debug_overlay_img
+    )
 
     # Note: When running autonomously on the actual robot, you can comment these out
     # so the robot code doesn't freeze waiting for you to press a key.

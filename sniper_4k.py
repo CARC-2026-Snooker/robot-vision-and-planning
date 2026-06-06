@@ -51,7 +51,7 @@ from config import (
     # Map display
     MAP_SCALE as SCALE, MAP_PADDING as PADDING,
     # Network — for telemetry broadcast
-    TELEMETRY_PORT,
+    TELEMETRY_PORT, SNIPER_TELEMETRY_PORT, SNIPER_FIRE_PORT, 
 )
 from tracking import get_global_camera_pose, apply_cam_offset
 
@@ -284,8 +284,8 @@ class Sniper4kThread(threading.Thread):
             self._disp_h = disp_h
 
             # Also build a standalone colour mask image at display resolution
-            disp_w = self._actual_w // 2
-            disp_h = self._actual_h // 2
+            disp_w = self._actual_w // 4
+            disp_h = self._actual_h // 4
             mask_bgr_small = np.zeros((disp_h, disp_w, 3), dtype=np.uint8)
             mask_bgr_small[cv2.resize(ball_mask_binary, (disp_w, disp_h)) > 0] = mask_colour
 
@@ -318,6 +318,10 @@ def main():
     except FileNotFoundError:
         print("Error: No selected_target.json found.")
         return
+
+    fire_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    fire_sock.bind(("0.0.0.0", SNIPER_FIRE_PORT))
+    fire_sock.setblocking(False)
 
     target_pocket   = target_data["target_pocket"]
     target_tag_id   = POCKET_TO_TAG[target_pocket]
@@ -432,6 +436,21 @@ def main():
     # new_main3, extended with sniper-specific fields so SniperState works.
     _telem_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+    startup_pkt = {
+        "initialized": False,
+        "state": "STARTING",
+        "app_state": "AIMING",
+        "sniper_active": True,
+        "shot_mode": SHOT_MODE,
+        "target_pocket": target_pocket,
+        "target_zone": target_data.get("target_ball_zone", "?"),
+    }
+    
+    _telem_sock.sendto(
+        json.dumps(startup_pkt).encode(),
+        ("127.0.0.1", SNIPER_TELEMETRY_PORT)
+    )
+
     _hd_frame_count  = 0
     debug_tag_estimates = []   # persists across skipped frames
 
@@ -470,6 +489,7 @@ def main():
             t, R = tag.pose_t, tag.pose_R
             pose = get_global_camera_pose(tag.tag_id, t, R)
             if pose is None: continue
+            # print("HI")
             dist = math.sqrt(t[0][0]**2 + t[1][0]**2 + t[2][0]**2)
             if dist > MAX_TAG_DISTANCE: continue
             cam_x, cam_y, gdx, gdy = pose
@@ -484,6 +504,8 @@ def main():
             robot_pose = (robot_x, robot_y, gdx, gdy)
             w = 1.0 / (dist**3 + 0.001)
             debug_tag_estimates.append({"id": tag.tag_id, "pose": robot_pose, "dist": dist, "w": w})
+            print(f"  Tag {tag.tag_id} dist={dist:.2f}m pose=({robot_x:.3f},{robot_y:.3f})")
+        print(f"[Sniper HD] Tags seen this frame: {len(tags_hd)} | debug_estimates: {len(debug_tag_estimates)} | initialized={initialized}")
 
         if debug_tag_estimates:
             last_seen_time = time.time()
@@ -606,47 +628,42 @@ def main():
             lateral_mm = None
             lat_locked = False
 
+        print(f"before broadcast initialized is : {initialized} | x_error={x_error:.1f} | y_error={y_error:.1f} | state={state_text}")
+
         # ════════════════════════════════════════════════════════════════════
         # 3.5  BROADCAST SNIPER TELEMETRY
-        # Same port as new_main3 so mission_controller.RobotState (or the new
-        # SniperState class) sees live data while the sniper window is open.
         # ════════════════════════════════════════════════════════════════════
         _sniper_pkt = {
-            # ── Standard fields (same as new_main3 packet) ────────────────
-            "initialized":   initialized,
+            "initialized":   bool(initialized),
             "x_mm":          round(last_x * 1000.0, 1),
             "y_mm":          round(last_y * 1000.0, 1),
             "heading_dx":    round(last_dx, 3),
             "heading_dy":    round(last_dy, 3),
             "state":         state_text,
             "app_state":     "AIMING",
-            # ── Sniper-specific fields ─────────────────────────────────────
-            "sniper_active":     True,
-            "shot_mode":         SHOT_MODE,          # "STRAIGHT" | "CUT"
-            "target_pocket":     target_pocket,
-            "target_zone":       target_data.get("target_ball_zone", "?"),
-            "ball_color":        ball_color,
-            "tag_found_4k":      tag_found_4k,
-            # Angle correction (positive → TURN RIGHT to reduce)
+            "sniper_active": True,
+            "shot_mode":     SHOT_MODE,
+            "target_pocket": target_pocket,
+            "target_zone":   target_data.get("target_ball_zone", "?"),
+            "ball_color":    ball_color,
+            "tag_found_4k":  bool(tag_found_4k),
             "ang_correction_deg": round(correction, 3) if tag_found_4k else None,
-            "ang_locked":        ang_locked,
-            # Lateral error (STRAIGHT mode only; None for CUT)
-            "lateral_mm":        round(lateral_mm, 1) if lateral_mm is not None else None,
-            "lat_locked":        lat_locked,
-            # HD position errors vs plan
-            "x_error_mm":        round(x_error, 1),
-            "y_error_mm":        round(y_error, 1),
-            # Combined lock
-            "pos_locked":        pos_locked,
-            "fully_locked":      pos_locked and ang_locked,
+            "ang_locked":    bool(ang_locked),
+            "lateral_mm":    round(lateral_mm, 1) if lateral_mm is not None else None,
+            "lat_locked":    bool(lat_locked),
+            "x_error_mm":    round(x_error, 1),
+            "y_error_mm":    round(y_error, 1),
+            "pos_locked":    bool(pos_locked),
+            "fully_locked":  bool(pos_locked and ang_locked),
         }
+
         try:
             _telem_sock.sendto(
-                json.dumps(_sniper_pkt).encode(),
-                ("127.0.0.1", TELEMETRY_PORT)
+                json.dumps(_sniper_pkt).encode('utf-8'),
+                ("127.0.0.1", SNIPER_TELEMETRY_PORT)
             )
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Sniper TELEMETRY ERROR] {e}")
 
         # ════════════════════════════════════════════════════════════════════
         # 4. DRAW 4K VIEW  (with HUD overlaid)
@@ -916,6 +933,19 @@ def main():
         elif key == 27:
             print("Shot aborted (ESC).")
             break
+
+        try:
+            raw_cmd, cmd_addr = fire_sock.recvfrom(1024)
+            msg = json.loads(raw_cmd.decode())
+            if msg.get("cmd") == "fire":
+                print(f"[{SHOT_MODE}] FIRE!  Angle={correction:.2f}°  "
+                  f"X={last_x*1000:.1f}mm  Y={last_y*1000:.1f}mm")
+                break
+        except BlockingIOError:
+            pass   # no command waiting — normal path every frame
+        except Exception as _cmd_e:
+            print(f"[CMD] command error: {_cmd_e}")
+
 
     sniper_thread.stop()
     cap_hd.release()
