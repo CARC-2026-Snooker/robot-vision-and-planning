@@ -226,20 +226,37 @@ def generate_shooting_plan(detected_zones):
     return shooting_plan
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    # Allows the HD Camera script to pass the freshly taken photo via command line
-    if len(sys.argv) > 1:
-        img_path = sys.argv[1]
-    else:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("image_path", nargs="?", default=None)
+    parser.add_argument("--robot_x",  type=float, default=None,
+                        help="Robot centre X in mm (world frame)")
+    parser.add_argument("--robot_y",  type=float, default=None,
+                        help="Robot centre Y in mm (world frame)")
+    parser.add_argument("--heading",  type=float, default=270.0,
+                        help="Robot heading in degrees (270 = toward tags)")
+    parser.add_argument("--tag4_px", type=float, default=None,
+                        help="Pixel X of tag 4 centre in the scan frame (for zone correction)")
+    args = parser.parse_args()
+
+    img_path = args.image_path
+    if img_path is None:
         img_path = r"camera_images\img_21_colored.jpg"
-    
-        # OPTION B: Run using live physical camera acquisition during competition
-        # print("Initializing live hardware camera tracking...")
-        # live_detections = detect_balls_in_zones() # No arguments triggers live camera frame
-    
+
     print(f"Running vision module with image: {img_path}")
-    live_detections = detect_balls_in_zones(img_path)
+    if args.robot_x is not None and args.robot_y is not None:
+        print(f"Robot position: ({args.robot_x:.0f}, {args.robot_y:.0f})mm  heading={args.heading:.1f}°")
+    if args.tag4_px is not None:
+        print(f"Tag 4 pixel x: {args.tag4_px:.1f}")
+
+    live_detections = detect_balls_in_zones(
+        img_path,
+        robot_x_mm  = args.robot_x,
+        robot_y_mm  = args.robot_y,
+        heading_deg = args.heading,
+        tag4_pixel_x = args.tag4_px,
+    )
     if live_detections:
         generate_shooting_plan(live_detections)
     else:

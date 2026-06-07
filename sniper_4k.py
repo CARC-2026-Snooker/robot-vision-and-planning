@@ -51,9 +51,12 @@ from config import (
     # Map display
     MAP_SCALE as SCALE, MAP_PADDING as PADDING,
     # Network — for telemetry broadcast
-    TELEMETRY_PORT, SNIPER_TELEMETRY_PORT, SNIPER_FIRE_PORT, 
+    TELEMETRY_PORT, SNIPER_TELEMETRY_PORT, SNIPER_FIRE_PORT,
+    LINE_INTERSECT_BLEND,
 )
-from tracking import get_global_camera_pose, apply_cam_offset
+from tracking import get_global_camera_pose, apply_cam_offset, compute_line_intersections
+
+HAS_DISPLAY = bool(os.environ.get("DISPLAY"))
 
 # ── Derived constants ─────────────────────────────────────────────────────────
 CANVAS_W = int((ARENA_BOUNDS[2] - ARENA_BOUNDS[0]) * SCALE) + 2 * PADDING
@@ -453,6 +456,7 @@ def main():
 
     _hd_frame_count  = 0
     debug_tag_estimates = []   # persists across skipped frames
+    raw_circle_estimates = []  # persists across skipped frames
 
     while True:
         # ════════════════════════════════════════════════════════════════════
@@ -479,9 +483,10 @@ def main():
                              camera_params_hd[2], camera_params_hd[3] - y_start]
             tags_hd = detector_hd.detect(gray_hd, estimate_tag_pose=True,
                                          camera_params=adj_params_hd, tag_size=tag_size_hd)
-            debug_tag_estimates = []
+            debug_tag_estimates  = []   # fresh results this frame
+            raw_circle_estimates = []   # fresh results this frame
         else:
-            tags_hd = []   # skip; keep previous debug_tag_estimates
+            tags_hd = []   # skip; keep previous lists
 
         for tag in tags_hd:
             tag.corners[:, 1] += y_start
@@ -489,13 +494,23 @@ def main():
             t, R = tag.pose_t, tag.pose_R
             pose = get_global_camera_pose(tag.tag_id, t, R)
             if pose is None: continue
-            # print("HI")
             dist = math.sqrt(t[0][0]**2 + t[1][0]**2 + t[2][0]**2)
             if dist > MAX_TAG_DISTANCE: continue
             cam_x, cam_y, gdx, gdy = pose
             # Apply camera-to-robot-centre offset
             robot_x, robot_y = apply_cam_offset(cam_x, cam_y, gdx, gdy,
                                                  HD_CAM_FORWARD_M, HD_CAM_SIDEWAYS_M)
+
+            # ── Circle-intersection entry — ALL distance-valid tags ────────
+            # Kept separate from pose estimates: distance is reliable even when
+            # the pose is rejected by bounds/jump filter, so these tags still
+            # improve the circle intersection result.
+            raw_circle_estimates.append({
+                "id": tag.tag_id, "dist": dist,
+                "pose": (robot_x, robot_y, gdx, gdy),
+            })
+
+            # ── Pose-based entry — apply bounds + jump filter ─────────────
             if not (ARENA_BOUNDS[0] - OUT_OF_BOUNDS_LEEWAY <= robot_x <= ARENA_BOUNDS[2] + OUT_OF_BOUNDS_LEEWAY and
                     ARENA_BOUNDS[1] - OUT_OF_BOUNDS_LEEWAY <= robot_y <= ARENA_BOUNDS[3] + OUT_OF_BOUNDS_LEEWAY):
                 continue
@@ -531,6 +546,14 @@ def main():
             raw_dx /= total_w; raw_dy /= total_w
             mag = math.hypot(raw_dx, raw_dy)
             if mag > 0: raw_dx /= mag; raw_dy /= mag
+
+            # ── Circle-intersection blend ──────────────────────────────────
+            # Uses raw_circle_estimates (distance-only filtered) — tags rejected
+            # by bounds/jump still contribute their distance to the circles.
+            isect = compute_line_intersections(raw_circle_estimates)
+            if isect and LINE_INTERSECT_BLEND > 0:
+                raw_x = (1 - LINE_INTERSECT_BLEND) * raw_x + LINE_INTERSECT_BLEND * isect[0]
+                raw_y = (1 - LINE_INTERSECT_BLEND) * raw_y + LINE_INTERSECT_BLEND * isect[1]
 
             # ── Apply calibration BEFORE the low-pass filter ───────────────
             # Must be here — applying after smoothing compounds the scale
@@ -795,8 +818,9 @@ def main():
                 cv2.putText(hud, "HD TRACKING LOST",
                             (30, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
 
-        cv2.namedWindow("4K Sniper View", cv2.WINDOW_NORMAL)
-        cv2.imshow("4K Sniper View", hud)
+        if HAS_DISPLAY:
+            cv2.namedWindow("4K Sniper View", cv2.WINDOW_NORMAL)
+            cv2.imshow("4K Sniper View", hud)
 
         # ════════════════════════════════════════════════════════════════════
         # 5. DRAW 2D MAP  (identical style to new_main3.py)
@@ -907,6 +931,46 @@ def main():
         cv2.line(map_canvas, tgt_pt, pt1, cone_color, 1)
         cv2.line(map_canvas, tgt_pt, pt2, cone_color, 1)
 
+        # ── Circle-intersection rays (dashed grey — distance-based, wider filter) ──
+        # Uses raw_circle_estimates so tags excluded from pose tracking due to
+        # bounds/jump checks still show their distance circles here.
+        # Distance is stable and doesn't need the same strict filtering as pose.
+        isect_viz = compute_line_intersections(raw_circle_estimates)
+
+        if isect_viz:
+            isect_pt = world_to_pixel(isect_viz[0], isect_viz[1])
+
+            # White ring showing intersection location
+            cv2.circle(map_canvas, isect_pt, 6, (255, 255, 255), 2)
+
+            # Dashed rays from tag locations to the intersection
+            for entry in raw_circle_estimates:
+                tid = entry["id"]
+
+                if tid in KNOWN_TAGS:
+                    tag_info = KNOWN_TAGS[tid]
+                    pt_tag = world_to_pixel(tag_info["x"], tag_info["y"])
+
+                    x0, y0 = pt_tag
+                    x1, y1 = isect_pt
+
+                    steps = max(1, int(math.hypot(x1 - x0, y1 - y0) / 8))
+
+                    for s in range(0, steps, 2):
+                        fx0 = int(x0 + (x1 - x0) * s / steps)
+                        fy0 = int(y0 + (y1 - y0) * s / steps)
+
+                        fx1 = int(x0 + (x1 - x0) * min(s + 1, steps) / steps)
+                        fy1 = int(y0 + (y1 - y0) * min(s + 1, steps) / steps)
+
+                        cv2.line(
+                            map_canvas,
+                            (fx0, fy0),
+                            (fx1, fy1),
+                            (200, 200, 200),
+                            1
+                        )
+
         # Live robot
         if initialized:
             robot_col = (0, 255, 0) if pos_locked else (255, 80, 80)
@@ -918,13 +982,17 @@ def main():
                         (cam_pt[0]-20, cam_pt[1]+22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, robot_col, 1)
 
-        cv2.namedWindow("2D Sniper Map", cv2.WINDOW_NORMAL)
-        cv2.imshow("2D Sniper Map", map_canvas)
+        if HAS_DISPLAY:
+            cv2.namedWindow("2D Sniper Map", cv2.WINDOW_NORMAL)
+            cv2.imshow("2D Sniper Map", map_canvas)
 
         # ════════════════════════════════════════════════════════════════════
         # 6. KEY HANDLING
         # ════════════════════════════════════════════════════════════════════
-        key = cv2.waitKey(1) & 0xFF
+        if HAS_DISPLAY:
+            key = cv2.waitKey(1) & 0xFF
+        else:
+            key = -1
 
         if key == ord('f') and pos_locked and ang_locked:
             print(f"[{SHOT_MODE}] FIRE!  Angle={correction:.2f}°  "
@@ -946,12 +1014,10 @@ def main():
         except Exception as _cmd_e:
             print(f"[CMD] command error: {_cmd_e}")
 
-
     sniper_thread.stop()
     cap_hd.release()
     _telem_sock.close()
     cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     main()

@@ -49,6 +49,8 @@ from config import (
     DISPLAY_SCALE,
 )
 
+HAS_DISPLAY = bool(os.environ.get("DISPLAY"))
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TUNABLE PARAMETERS
 # All values calibrated for the camera view shown in the reference images.
@@ -428,6 +430,7 @@ def do_ball_align(mc, align_state: BallAlignState,
             lat = st.get("lateral_err_px")
             dst = st.get("distance_state", "?")
             area = st.get("area", 0)
+            dist_err = max(0, AREA_CLOSE_THRESHOLD - area)
             print(f"  ball={'FOUND' if bf else 'LOST'}  "
                   f"lat={'---' if lat is None else f'{lat:+.0f}px'}  "
                   f"dist={dst}  area={area}  "
@@ -455,7 +458,12 @@ def do_ball_align(mc, align_state: BallAlignState,
         # since robot faces 270° = away from ball)
         # do lat err scaling
         vX = {"RIGHT": ALIGN_STRAFE_POWER * abs(lat) / 300, "LEFT": -ALIGN_STRAFE_POWER * abs(lat) / 300}.get(x_cmd, 0)
-        vY = {"BACK": -ALIGN_BACK_POWER}.get(y_cmd, 0)   # negative = back
+        # vY = {"BACK": -ALIGN_BACK_POWER}.get(y_cmd, 0)   # negative = back
+        if y_cmd == "BACK":
+            scale = min((dist_err / AREA_CLOSE_THRESHOLD) * 2, 50.0)
+            vY = -ALIGN_BACK_POWER * scale
+        else:
+            vY = 0
 
         mc.send(MoveCmd(cmd="omni", vX=vX, vY=vY, vR=0))
         time.sleep(0.05)
@@ -586,22 +594,24 @@ def main():
                                                 int(side.shape[0]*scale)))
                 display[:side_small.shape[0], :side_small.shape[1]] = side_small
 
-            # Calculate the scaled dimensions based on your 960x540 baseline
-            win_w = int(960 * DISPLAY_SCALE)
-            win_h = int(540 * DISPLAY_SCALE)
+            if HAS_DISPLAY:
+                win_w = int(960 * DISPLAY_SCALE)
+                win_h = int(540 * DISPLAY_SCALE)
 
-            # Physically resize the image array to save rendering performance
-            # cv2.INTER_AREA is the preferred interpolation method for shrinking images
-            display_scaled = cv2.resize(display, (win_w, win_h), interpolation=cv2.INTER_AREA)
+                display_scaled = cv2.resize(
+                    display,
+                    (win_w, win_h),
+                    interpolation=cv2.INTER_AREA
+                )
 
-            cv2.namedWindow("Ball Align", cv2.WINDOW_NORMAL)
-            cv2.imshow("Ball Align", display_scaled)
+                cv2.namedWindow("Ball Align", cv2.WINDOW_NORMAL)
+                cv2.imshow("Ball Align", display_scaled)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-        elif key == ord('t'):
-            show_debug = not show_debug
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+                elif key == ord('t'):
+                    show_debug = not show_debug
 
     cap.release()
     broadcaster.close()

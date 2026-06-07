@@ -46,13 +46,19 @@ from tracking import (
 )
 from movement_client import MovementClient, compute_move_cmd
 
+HAS_DISPLAY = bool(os.environ.get("DISPLAY"))
+
 # ── Load position calibration (written by calibrate_position.py) ─────────────
 # calibration.json lives in the project root (one level up from this file).
 # If absent or invalid, identity transform is used (no correction).
 _CAL_FILE = os.path.join(os.path.dirname(__file__), "..", "calibration.json")
-_CAL = {"scale_x": 1.0, "offset_x_m": 0.0,
-        "scale_y": 1.0, "offset_y_m": 0.0,
-        "heading_scale": 1.0, "heading_offset_deg": 0.0}
+_CAL = {
+    "scale_x": 1.0, "offset_x_m": 0.0,
+    "scale_y": 1.0, "offset_y_m": 0.0,
+    "heading_idw_points": [],
+    "heading_idw_power": 2,
+    "heading_idw_fallback_deg": 0.0,
+}
 try:
     with open(_CAL_FILE) as _f:
         _loaded = json.load(_f)
@@ -60,11 +66,29 @@ try:
     print(f"[new_main3] Calibration loaded from {_CAL_FILE}")
     print(f"  X: scale={_CAL['scale_x']:.4f}  offset={_CAL['offset_x_m']*1000:+.1f}mm")
     print(f"  Y: scale={_CAL['scale_y']:.4f}  offset={_CAL['offset_y_m']*1000:+.1f}mm")
-    print(f"  Heading: scale={_CAL['heading_scale']:.6f}  offset={_CAL['heading_offset_deg']:+.4f}°")
+    print(f"  Heading: IDW {len(_CAL['heading_idw_points'])} pts  "
+          f"fallback={_CAL['heading_idw_fallback_deg']:+.3f}°")
 except FileNotFoundError:
     print("[new_main3] No calibration.json found — using raw tracker values.")
 except Exception as _e:
     print(f"[new_main3] calibration.json load error: {_e} — using raw values.")
+
+
+def _idw_heading_correction(x_m: float, y_m: float) -> float:
+    """Position-dependent heading correction via IDW — identical to sniper_4k."""
+    pts = _CAL["heading_idw_points"]
+    if not pts:
+        return _CAL["heading_idw_fallback_deg"]
+    x_mm = x_m * 1000.0;  y_mm = y_m * 1000.0
+    power = _CAL["heading_idw_power"]
+    eps   = 10.0 ** 2
+    total_w = total_c = 0.0
+    for p in pts:
+        d2 = (x_mm - p["x_mm"])**2 + (y_mm - p["y_mm"])**2
+        w  = 1.0 / (d2 + eps) ** power
+        total_w += w
+        total_c += w * p["correction_deg"]
+    return total_c / total_w
 
 arena_w_meters = ARENA_BOUNDS[2] - ARENA_BOUNDS[0]
 arena_h_meters = ARENA_BOUNDS[3] - ARENA_BOUNDS[1]
@@ -296,9 +320,14 @@ def main():
                     # ── Apply calibration to raw value BEFORE smoothing ────
                     # MUST be here. If applied to last_x/last_y after the filter,
                     # the scale factor multiplies itself every frame → drift.
-                    # e.g. scale_y=1.02: frame1→2.4265, frame2→2.4781, → runaway.
                     raw_avg_x = _CAL["scale_x"] * raw_avg_x + _CAL["offset_x_m"]
                     raw_avg_y = _CAL["scale_y"] * raw_avg_y + _CAL["offset_y_m"]
+                    # Heading IDW correction — position-dependent, applied pre-filter
+                    _raw_h  = math.degrees(math.atan2(raw_avg_dy, raw_avg_dx)) % 360
+                    _h_corr = _idw_heading_correction(raw_avg_x, raw_avg_y)
+                    _cal_h  = (_raw_h + _h_corr) % 360
+                    raw_avg_dx = math.cos(math.radians(_cal_h))
+                    raw_avg_dy = math.sin(math.radians(_cal_h))
 
                     history_raw_x.append(raw_avg_x); history_raw_y.append(raw_avg_y)
                     if not initialized:
@@ -327,13 +356,6 @@ def main():
                     
                     mag_smooth = math.sqrt(last_dx**2 + last_dy**2)
                     if mag_smooth > 0: last_dx /= mag_smooth; last_dy /= mag_smooth
-
-                    # Heading: apply scale then offset — safe after smoothing
-                    if _CAL["heading_scale"] != 1.0 or _CAL["heading_offset_deg"] != 0.0:
-                        _h_raw = math.degrees(math.atan2(last_dy, last_dx)) % 360
-                        _h_cal = (_CAL["heading_scale"] * _h_raw + _CAL["heading_offset_deg"]) % 360
-                        last_dx = math.cos(math.radians(_h_cal))
-                        last_dy = math.sin(math.radians(_h_cal))
 
                     text_color = (0, 255, 0)
             else:
@@ -384,7 +406,10 @@ def main():
                 pass
 
             # --- STATE MACHINE UI & KEYBINDS ---
-            key = cv2.waitKey(1) & 0xFF
+            if HAS_DISPLAY:
+                key = cv2.waitKey(1) & 0xFF
+            else:
+                key = -1
 
             # ── Check for remote commands from mission_controller ──────────
             # Non-blocking: if no command waiting, continues immediately.
@@ -395,7 +420,33 @@ def main():
                     # Treat exactly like pressing 's' — use already-captured frame
                     print("[CMD] Remote scan triggered by mission_controller")
                     cv2.imwrite("current_scan.jpg", clean_frame)
-                    subprocess.run([sys.executable, "snooker_planner.py", "current_scan.jpg"])
+                    # Pass current robot position so the planner uses projected zones
+                    _hdg = (math.degrees(math.atan2(last_dy, last_dx)) + 360) % 360
+
+                    # ── Find tag 4 pixel in the scan frame ────────────────────
+                    # Re-detect tags on the pristine scan frame so the pixel
+                    # position is unaffected by any overlaid graphics.
+                    _scan_gray = cv2.cvtColor(clean_frame, cv2.COLOR_BGR2GRAY)
+                    _scan_tags = detector.detect(_scan_gray, estimate_tag_pose=False,
+                                                 camera_params=None, tag_size=None)
+                    _tag4_px = None
+                    for _t in _scan_tags:
+                        if _t.tag_id == 4:
+                            _tag4_px = float(_t.center[0])
+                            print(f"[CMD] Tag 4 found at pixel x={_tag4_px:.1f}")
+                            break
+                    if _tag4_px is None:
+                        print("[CMD] Tag 4 not found in scan frame — using raw projection")
+
+                    _planner_args = [
+                        sys.executable, "snooker_planner.py", "current_scan.jpg",
+                        "--robot_x", str(round(last_x * 1000, 1)),
+                        "--robot_y", str(round(last_y * 1000, 1)),
+                        "--heading", str(round(_hdg, 2)),
+                    ]
+                    if _tag4_px is not None:
+                        _planner_args += ["--tag4_px", str(round(_tag4_px, 1))]
+                    subprocess.run(_planner_args)
                     if os.path.exists("robot_shooting_plan.json"):
                         with open("robot_shooting_plan.json", "r") as f:
                             shooting_plans = json.load(f)
@@ -432,9 +483,31 @@ def main():
                 
                 if key == ord('s'):
                     print("Scanning table...")
-                    # Save the pristine image so detection boxes don't mess up color masking
                     cv2.imwrite("current_scan.jpg", clean_frame)
-                    subprocess.run([sys.executable, "snooker_planner.py", "current_scan.jpg"])
+                    _hdg = (math.degrees(math.atan2(last_dy, last_dx)) + 360) % 360
+
+                    # ── Find tag 4 pixel in the scan frame ────────────────────
+                    _scan_gray = cv2.cvtColor(clean_frame, cv2.COLOR_BGR2GRAY)
+                    _scan_tags = detector.detect(_scan_gray, estimate_tag_pose=False,
+                                                 camera_params=None, tag_size=None)
+                    _tag4_px = None
+                    for _t in _scan_tags:
+                        if _t.tag_id == 4:
+                            _tag4_px = float(_t.center[0])
+                            print(f"[S-key] Tag 4 found at pixel x={_tag4_px:.1f}")
+                            break
+                    if _tag4_px is None:
+                        print("[S-key] Tag 4 not found in scan frame — using raw projection")
+
+                    _planner_args = [
+                        sys.executable, "snooker_planner.py", "current_scan.jpg",
+                        "--robot_x", str(round(last_x * 1000, 1)),
+                        "--robot_y", str(round(last_y * 1000, 1)),
+                        "--heading", str(round(_hdg, 2)),
+                    ]
+                    if _tag4_px is not None:
+                        _planner_args += ["--tag4_px", str(round(_tag4_px, 1))]
+                    subprocess.run(_planner_args)
                     
                     if os.path.exists("robot_shooting_plan.json"):
                         with open("robot_shooting_plan.json", "r") as f:
@@ -605,16 +678,21 @@ def main():
                 cv2.putText(map_canvas, "Robot", (cam_pt[0]-16, cam_pt[1]+24), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
 
             # Show Both Windows (scale down for Pi GPU performance)
-            if DISPLAY_SCALE != 1.0:
-                dw = int(frame.shape[1] * DISPLAY_SCALE)
-                dh = int(frame.shape[0] * DISPLAY_SCALE)
-                cv2.imshow("HD Navigator", cv2.resize(frame, (dw, dh)))
-                mw = int(map_canvas.shape[1] * DISPLAY_SCALE)
-                mh = int(map_canvas.shape[0] * DISPLAY_SCALE)
-                cv2.imshow("2D Real-Time Field Map", cv2.resize(map_canvas, (mw, mh)))
-            else:
-                cv2.imshow("HD Navigator", frame)
-                cv2.imshow("2D Real-Time Field Map", map_canvas)
+            if HAS_DISPLAY:
+                if DISPLAY_SCALE != 1.0:
+                    dw = int(frame.shape[1] * DISPLAY_SCALE)
+                    dh = int(frame.shape[0] * DISPLAY_SCALE)
+                    cv2.imshow("HD Navigator", cv2.resize(frame, (dw, dh)))
+
+                    mw = int(map_canvas.shape[1] * DISPLAY_SCALE)
+                    mh = int(map_canvas.shape[0] * DISPLAY_SCALE)
+                    cv2.imshow(
+                        "2D Real-Time Field Map",
+                        cv2.resize(map_canvas, (mw, mh))
+                    )
+                else:
+                    cv2.imshow("HD Navigator", frame)
+                    cv2.imshow("2D Real-Time Field Map", map_canvas)
             
             if key == ord('q'):
                 quit_requested = True
