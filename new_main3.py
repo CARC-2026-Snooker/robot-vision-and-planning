@@ -33,11 +33,16 @@ from config import (
     TELEMETRY_PORT, MOVEMENT_HOST, MOVEMENT_CMD_PORT,
     MOVE_DEAD_MM, ROT_DEAD_DEG,
 )
-# VISION_CMD_PORT may not exist in older config files — default to 5007
+# VISION_CMD_PORT and IMU_TELEMETRY_PORT may not exist in older config files
 try:
     from config import VISION_CMD_PORT
 except ImportError:
     VISION_CMD_PORT = 5007
+
+try:
+    from config import IMU_TELEMETRY_PORT
+except ImportError:
+    IMU_TELEMETRY_PORT = 5009
 from tracking import (
     get_global_camera_pose,
     apply_cam_offset,
@@ -136,7 +141,17 @@ def main():
     # new_main3 handles it using its own open camera handle.
     cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     cmd_sock.bind(("0.0.0.0", VISION_CMD_PORT))
-    cmd_sock.setblocking(False)   # non-blocking: checked every frame, never waits
+    cmd_sock.setblocking(False)
+
+    # IMU subscriber — receives snapshots from movement_server at ~30Hz.
+    # Non-blocking: we just drain whatever arrived since the last frame.
+    # Falls back gracefully if movement_server has no IMU (is_ready stays False).
+    _imu_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    _imu_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    _imu_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    _imu_sock.bind(("0.0.0.0", IMU_TELEMETRY_PORT))
+    _imu_sock.setblocking(False)
+    _imu_snap = {"is_ready": False, "is_moving": False}  # latest IMU state   # non-blocking: checked every frame, never waits
 
     # Movement client — sends drive commands to movement_server.py
     mc = MovementClient()
@@ -333,21 +348,42 @@ def main():
                     if not initialized:
                         last_x, last_y, last_dx, last_dy = raw_avg_x, raw_avg_y, raw_avg_dx, raw_avg_dy
                         initialized = True
-                    
-                    movement_metric = math.sqrt(np.std(history_raw_x)**2 + np.std(history_raw_y)**2) if len(history_raw_x) >= 2 else 0.0
 
-                    avg_dist = sum_distances / n
-                    dist_multiplier = max(1.0, min(avg_dist ** 2, 12.0))
-                    still_threshold = BASE_STILL_THRESHOLD * dist_multiplier
-                    move_threshold  = BASE_MOVE_THRESHOLD  * dist_multiplier
-                
-                    if movement_metric <= still_threshold:
-                        alpha, state_text = STILL_ALPHA, "STILL"
-                    elif movement_metric >= move_threshold:
-                        alpha, state_text = MOVE_ALPHA, "MOVING"
+                    # ── Drain IMU socket (keep only the most recent packet) ──
+                    # Non-blocking: if movement_server hasn't sent yet this frame,
+                    # we just keep the previous _imu_snap — no delay.
+                    while True:
+                        try:
+                            _raw, _ = _imu_sock.recvfrom(256)
+                            _imu_snap = json.loads(_raw.decode())
+                        except BlockingIOError:
+                            break
+                        except Exception:
+                            break
+
+                    # ── STILL / MOVING ─────────────────────────────────────
+                    # Use IMU accel if the IMU is calibrated and ready.
+                    # IMU is much faster (~0.1s response) than the camera std-window (~0.5s).
+                    # Fall back to the camera std-window if IMU is not available.
+                    if _imu_snap.get("is_ready"):
+                        if _imu_snap.get("is_moving"):
+                            alpha, state_text = MOVE_ALPHA, "MOVING"
+                        else:
+                            alpha, state_text = STILL_ALPHA, "STILL"
                     else:
-                        ratio = (movement_metric - still_threshold) / (move_threshold - still_threshold)
-                        alpha, state_text = STILL_ALPHA + ratio * (MOVE_ALPHA - STILL_ALPHA), "TRANSITIONING"
+                        # Camera std-window fallback (original logic)
+                        movement_metric = math.sqrt(np.std(history_raw_x)**2 + np.std(history_raw_y)**2) if len(history_raw_x) >= 2 else 0.0
+                        avg_dist = sum_distances / n
+                        dist_multiplier = max(1.0, min(avg_dist ** 2, 12.0))
+                        still_threshold = BASE_STILL_THRESHOLD * dist_multiplier
+                        move_threshold  = BASE_MOVE_THRESHOLD  * dist_multiplier
+                        if movement_metric <= still_threshold:
+                            alpha, state_text = STILL_ALPHA, "STILL"
+                        elif movement_metric >= move_threshold:
+                            alpha, state_text = MOVE_ALPHA, "MOVING"
+                        else:
+                            ratio = (movement_metric - still_threshold) / (move_threshold - still_threshold)
+                            alpha, state_text = STILL_ALPHA + ratio * (MOVE_ALPHA - STILL_ALPHA), "TRANSITIONING"
                         
                     last_x = alpha * raw_avg_x + (1.0 - alpha) * last_x
                     last_y = alpha * raw_avg_y + (1.0 - alpha) * last_y

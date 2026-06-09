@@ -92,7 +92,7 @@ LATERAL_TOL_PX_ALIGN = 30    # px
 
 # Movement speeds for alignment (sent to movement_server via UDP)
 ALIGN_STRAFE_POWER = 50   # power for LEFT/RIGHT strafe during alignment
-ALIGN_BACK_POWER   = 50   # power for BACK movement during alignment
+ALIGN_BACK_POWER   = 200   # power for BACK movement during alignment
 
 # Broadcast port for ball_align telemetry
 # We reuse TELEMETRY_PORT but add ball_align_* fields so mission_controller
@@ -460,7 +460,7 @@ def do_ball_align(mc, align_state: BallAlignState,
         vX = {"RIGHT": ALIGN_STRAFE_POWER * abs(lat) / 300, "LEFT": -ALIGN_STRAFE_POWER * abs(lat) / 300}.get(x_cmd, 0)
         # vY = {"BACK": -ALIGN_BACK_POWER}.get(y_cmd, 0)   # negative = back
         if y_cmd == "BACK":
-            scale = min((dist_err / AREA_CLOSE_THRESHOLD) * 2, 50.0)
+            scale = min((dist_err / AREA_CLOSE_THRESHOLD), 1.0)
             vY = -ALIGN_BACK_POWER * scale
         else:
             vY = 0
