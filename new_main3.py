@@ -60,6 +60,10 @@ _CAL_FILE = os.path.join(os.path.dirname(__file__), "..", "calibration.json")
 _CAL = {
     "scale_x": 1.0, "offset_x_m": 0.0,
     "scale_y": 1.0, "offset_y_m": 0.0,
+    # NEW: per-point residual IDW for X and Y
+    "position_idw_points": [],
+    "position_idw_power": 2,
+    # Heading IDW (unchanged)
     "heading_idw_points": [],
     "heading_idw_power": 2,
     "heading_idw_fallback_deg": 0.0,
@@ -71,12 +75,55 @@ try:
     print(f"[new_main3] Calibration loaded from {_CAL_FILE}")
     print(f"  X: scale={_CAL['scale_x']:.4f}  offset={_CAL['offset_x_m']*1000:+.1f}mm")
     print(f"  Y: scale={_CAL['scale_y']:.4f}  offset={_CAL['offset_y_m']*1000:+.1f}mm")
-    print(f"  Heading: IDW {len(_CAL['heading_idw_points'])} pts  "
+    print(f"  Position IDW: {len(_CAL['position_idw_points'])} residual points")
+    print(f"  Heading IDW: {len(_CAL['heading_idw_points'])} pts  "
           f"fallback={_CAL['heading_idw_fallback_deg']:+.3f}°")
 except FileNotFoundError:
     print("[new_main3] No calibration.json found — using raw tracker values.")
 except Exception as _e:
     print(f"[new_main3] calibration.json load error: {_e} — using raw values.")
+
+
+def _idw_position_correction(raw_x_m: float, raw_y_m: float):
+    """
+    Return (corr_x_m, corr_y_m) — the IDW-interpolated residual corrections
+    to add on top of the global linear correction.
+
+    Each calibration point stores the residual = true - linear_corrected at
+    that point.  IDW interpolates those residuals so that between calibration
+    points the correction transitions smoothly.  Far from all calibration
+    points (fallback) the correction approaches zero (the global linear handles
+    the bulk drift; the IDW only adds the local fine corrections).
+
+    Lookup is done in raw-sensor space (raw_x_m, raw_y_m) using the stored
+    raw position of each calibration point — this avoids a chicken-and-egg
+    where we'd need the correction to find the correction.
+    """
+    pts = _CAL["position_idw_points"]
+    if not pts:
+        return 0.0, 0.0
+
+    raw_x_mm = raw_x_m * 1000.0
+    raw_y_mm = raw_y_m * 1000.0
+    power = _CAL["position_idw_power"]
+    eps = 20.0 ** 2   # 20mm epsilon to avoid division by zero at exact cal points
+
+    total_w = 0.0
+    sum_cx  = 0.0
+    sum_cy  = 0.0
+
+    for p in pts:
+        # Distance in raw-sensor space to this calibration point
+        d2 = (raw_x_mm - p["raw_x_mm"])**2 + (raw_y_mm - p["raw_y_mm"])**2
+        w  = 1.0 / (d2 + eps) ** power
+        total_w += w
+        sum_cx  += w * p["residual_x_m"]
+        sum_cy  += w * p["residual_y_m"]
+
+    if total_w < 1e-15:
+        return 0.0, 0.0
+
+    return sum_cx / total_w, sum_cy / total_w
 
 
 def _idw_heading_correction(x_m: float, y_m: float) -> float:
@@ -335,9 +382,17 @@ def main():
                     # ── Apply calibration to raw value BEFORE smoothing ────
                     # MUST be here. If applied to last_x/last_y after the filter,
                     # the scale factor multiplies itself every frame → drift.
+                    # Step 1: global linear correction (bulk drift + scale)
                     raw_avg_x = _CAL["scale_x"] * raw_avg_x + _CAL["offset_x_m"]
                     raw_avg_y = _CAL["scale_y"] * raw_avg_y + _CAL["offset_y_m"]
-                    # Heading IDW correction — position-dependent, applied pre-filter
+                    # Step 2: IDW residual correction (local zone errors)
+                    # Each calibration point stored its residual = true - linear_corrected.
+                    # IDW interpolates those residuals spatially so each zone of the table
+                    # gets its own fine correction on top of the global linear.
+                    _res_x, _res_y = _idw_position_correction(raw_avg_x, raw_avg_y)
+                    raw_avg_x += _res_x
+                    raw_avg_y += _res_y
+                    # Heading IDW correction — uses the fully corrected position
                     _raw_h  = math.degrees(math.atan2(raw_avg_dy, raw_avg_dx)) % 360
                     _h_corr = _idw_heading_correction(raw_avg_x, raw_avg_y)
                     _cal_h  = (_raw_h + _h_corr) % 360
@@ -401,7 +456,8 @@ def main():
                 text_color = (0, 0, 255)
 
             # On-screen telemetry readout
-            cv2.putText(frame, f"State: {state_text} | Pos: ({last_x*100:.1f}cm, {last_y*100:.1f}cm)", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, text_color, 2)
+            curr_heading_deg = (math.degrees(math.atan2(last_dy, last_dx)) + 360) % 360
+            cv2.putText(frame, f"State: {state_text} | Pos: ({last_x*100:.1f}cm, {last_y*100:.1f}cm) | Head: {curr_heading_deg:.2f}", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, text_color, 2)
 
             # ── Compute movement command for AIMING state ────────────────
             move_cmd_dict = {"cmd": "stop"}

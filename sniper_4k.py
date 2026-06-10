@@ -52,7 +52,7 @@ from config import (
     MAP_SCALE as SCALE, MAP_PADDING as PADDING,
     # Network — for telemetry broadcast
     TELEMETRY_PORT, SNIPER_TELEMETRY_PORT, SNIPER_FIRE_PORT,
-    LINE_INTERSECT_BLEND,
+    LINE_INTERSECT_BLEND, SNIPER_4K_HEADING_WEIGHT
 )
 from tracking import get_global_camera_pose, apply_cam_offset, compute_line_intersections
 
@@ -75,6 +75,8 @@ _CAL_FILE = os.path.join(os.path.dirname(__file__), "..", "calibration.json")
 _CAL = {
     "scale_x": 1.0, "offset_x_m": 0.0,
     "scale_y": 1.0, "offset_y_m": 0.0,
+    "position_idw_points": [],
+    "position_idw_power": 2,
     "heading_idw_points": [],
     "heading_idw_power": 2,
     "heading_idw_fallback_deg": 0.0,
@@ -86,11 +88,33 @@ try:
     print(f"[Sniper] Calibration loaded: "
           f"X scale={_CAL['scale_x']:.4f} offset={_CAL['offset_x_m']*1000:+.1f}mm  "
           f"Y scale={_CAL['scale_y']:.4f} offset={_CAL['offset_y_m']*1000:+.1f}mm  "
+          f"pos IDW {len(_CAL['position_idw_points'])} pts  "
           f"heading IDW {len(_CAL['heading_idw_points'])} pts")
 except FileNotFoundError:
     print("[Sniper] No calibration.json — using raw tracker values.")
 except Exception as _e:
     print(f"[Sniper] calibration.json load error: {_e} — using raw values.")
+
+
+def _idw_position_correction(raw_x_m: float, raw_y_m: float):
+    """IDW residual correction for X and Y — see new_main3.py for full comments."""
+    pts = _CAL["position_idw_points"]
+    if not pts:
+        return 0.0, 0.0
+    raw_x_mm = raw_x_m * 1000.0
+    raw_y_mm = raw_y_m * 1000.0
+    power = _CAL["position_idw_power"]
+    eps = 20.0 ** 2
+    total_w = sum_cx = sum_cy = 0.0
+    for p in pts:
+        d2 = (raw_x_mm - p["raw_x_mm"])**2 + (raw_y_mm - p["raw_y_mm"])**2
+        w  = 1.0 / (d2 + eps) ** power
+        total_w += w
+        sum_cx  += w * p["residual_x_m"]
+        sum_cy  += w * p["residual_y_m"]
+    if total_w < 1e-15:
+        return 0.0, 0.0
+    return sum_cx / total_w, sum_cy / total_w
 
 
 def _idw_heading_correction(x_m: float, y_m: float) -> float:
@@ -129,21 +153,28 @@ def draw_map_line(canvas, x1, y1, x2, y2, color=(255, 255, 255), thickness=2):
 # Produces: angle correction, raw display frame (resized), tag found flag.
 # ─────────────────────────────────────────────────────────────────────────────
 class Sniper4kThread(threading.Thread):
-    def __init__(self, target_tag_id, target_relative_angle, ball_color="Red", corner_offset_px=0.0):
+    def __init__(self, target_tag_id, ball_color="Red",
+                 corner_offset_px=0.0, cut_offset_sign=0.0, cut_sin=0.0):
         super().__init__(daemon=True)
         self.target_tag_id         = target_tag_id
-        self.target_relative_angle = target_relative_angle
         self.ball_color            = ball_color
-        self.corner_offset_px      = corner_offset_px   # pixels from tag center to target line
+        self.corner_offset_px      = corner_offset_px   # STRAIGHT corner shots only
+        # CUT mode: aiming offset derived from ball pixel width each frame
+        # cut_offset_sign: +1 or -1, which side of ball to aim at
+        # cut_sin: sin(cut_angle_deg), the fraction of ball radius to offset
+        self.cut_offset_sign       = cut_offset_sign
+        self.cut_sin               = cut_sin
         self.tag_size              = 0.11
 
         # Shared results (written by thread, read by main loop)
-        self._lock         = threading.Lock()
-        self._correction   = 999.0
-        self._tag_found    = False
-        self._frame_720p   = None    # 4K view resized to 720p, with all overlays baked in
-        self._mask_720p    = None    # colour mask at 720p (BGR, ready to blend)
-        self._lateral_px   = None    # ball_centroid_x - tag_center_x at full res (or None)
+        self._lock          = threading.Lock()
+        self._heading_4k_deg   = None   # true robot heading from 4K tag poses (degrees, or None)
+        self._heading_4k_n     = 0      # number of tags that contributed to heading estimate
+        self._tag_found     = False
+        self._frame_720p    = None    # 4K view resized to quarter-res, overlays baked in
+        self._mask_720p     = None    # colour mask at same res (BGR, ready to blend)
+        self._lateral_px    = None    # CUT: (aiming_col - cam_centre_x); STRAIGHT: ball_cx - tag_cx
+        self._ball_width_px = None    # horizontal pixel span of the colour blob (for diagnostics)
 
         self.running  = True
         self.detector = Detector(families="tag36h11")
@@ -175,7 +206,10 @@ class Sniper4kThread(threading.Thread):
               f"fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}")
 
     def _get_ball_mask(self, frame_bgr):
-        """Return (mask, centroid_or_None). mask is a binary uint8 image."""
+        """Return (mask, centroid_or_None, ball_width_px).
+        mask is a binary uint8 image.
+        ball_width_px is the horizontal span of the largest colour blob, or None.
+        """
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         ranges = BALL_HSV.get(self.ball_color, BALL_HSV["Red"])
         mask = None
@@ -185,16 +219,20 @@ class Sniper4kThread(threading.Thread):
         # Light morphology to clean noise without destroying small detections
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        # Find centroid of largest blob
+        # Find centroid and width of largest blob
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        centroid = None
+        centroid    = None
+        ball_width_px = None
         if contours:
             largest = max(contours, key=cv2.contourArea)
             if cv2.contourArea(largest) > 150:
                 M = cv2.moments(largest)
                 if M["m00"] > 0:
                     centroid = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
-        return mask, centroid
+                # Horizontal span = ball width in pixels (more stable than fitting a circle)
+                x_bnd, _, w_bnd, _ = cv2.boundingRect(largest)
+                ball_width_px = w_bnd
+        return mask, centroid, ball_width_px
 
     def run(self):
         while self.running:
@@ -207,27 +245,60 @@ class Sniper4kThread(threading.Thread):
             frame_ud = cv2.remap(frame, self.map1, self.map2, cv2.INTER_LINEAR)
 
             # ── AprilTag detection ────────────────────────────────────────
+            # We detect ALL visible tags to build a robust heading estimate.
+            # Each tag provides an independent true-heading measurement via
+            # get_global_camera_pose() → (gx,gy,gdx,gdy).
+            # heading_from_tag = atan2(gdy, gdx) — this is the ACTUAL robot
+            # heading in world-frame degrees, not the tag's angle in the image.
+            # We distance-weight all tags and take a circular average.
             gray    = cv2.cvtColor(frame_ud, cv2.COLOR_BGR2GRAY)
             results = self.detector.detect(gray, estimate_tag_pose=True,
                                            camera_params=self.camera_params_4k,
                                            tag_size=self.tag_size)
 
             found      = False
-            correction = 999.0
-            tag_cx     = None   # tag center X in full-res pixels
+            tag_cx     = None   # target tag center X in full-res pixels (for visual)
             tag_cy     = None
             draw_frame = frame_ud.copy()
 
-            for tag in results:
-                if tag.tag_id != self.target_tag_id:
-                    continue
-                found = True
-                t_x = tag.pose_t[0][0]
-                t_z = tag.pose_t[2][0]
-                actual_angle = math.degrees(math.atan2(t_x, t_z))
-                correction   = actual_angle - self.target_relative_angle
+            # Accumulate heading contributions from all detected tags
+            sin_sum = 0.0
+            cos_sum = 0.0
+            heading_total_w = 0.0
+            heading_n = 0
 
-                # Draw tag bounding box
+            for tag in results:
+                # ── Extract heading from this tag (any tag) ────────────────
+                if tag.tag_id not in KNOWN_TAGS:
+                    continue
+                t_tag = tag.pose_t
+                R_tag = tag.pose_R
+                pose = get_global_camera_pose(tag.tag_id, t_tag, R_tag)
+                if pose is None:
+                    continue
+                gx, gy, gdx, gdy = pose
+                # Distance to tag for weighting (closer = more reliable)
+                dist_tag = math.sqrt(t_tag[0][0]**2 + t_tag[1][0]**2 + t_tag[2][0]**2)
+                if dist_tag < 1e-6:
+                    continue
+                w_tag = 1.0 / (dist_tag ** 2)   # 1/d² weighting
+                heading_rad = math.atan2(gdy, gdx)
+                sin_sum += w_tag * math.sin(heading_rad)
+                cos_sum += w_tag * math.cos(heading_rad)
+                heading_total_w += w_tag
+                heading_n += 1
+
+                # ── Visual overlays for the TARGET tag only ────────────────
+                if tag.tag_id != self.target_tag_id:
+                    # Non-target tags: small grey box only
+                    corners_nt = tag.corners.astype(int)
+                    for i in range(4):
+                        cv2.line(draw_frame, tuple(corners_nt[i]),
+                                 tuple(corners_nt[(i+1) % 4]), (80, 80, 80), 3)
+                    continue
+
+                # Target tag found
+                found = True
                 corners = tag.corners.astype(int)
                 for i in range(4):
                     cv2.line(draw_frame, tuple(corners[i]),
@@ -237,11 +308,11 @@ class Sniper4kThread(threading.Thread):
                 tag_cy = int(tag.center[1])
                 cv2.circle(draw_frame, (tag_cx, tag_cy), 14, (0, 255, 255), 4)
 
-                # Vertical guide line through tag center (cyan = tag center)
+                # Vertical guide line through target tag center (cyan)
                 cv2.line(draw_frame, (tag_cx, 0), (tag_cx, self._actual_h),
                          (0, 200, 255), 3)
 
-                # Offset target line (magenta) — where the ball should align to
+                # STRAIGHT corner offset target line (magenta)
                 if self.corner_offset_px != 0:
                     target_x = int(tag_cx + self.corner_offset_px)
                     cv2.line(draw_frame, (target_x, 0), (target_x, self._actual_h),
@@ -249,33 +320,105 @@ class Sniper4kThread(threading.Thread):
                     cv2.putText(draw_frame, "TARGET LINE",
                                 (target_x + 10, self._actual_h // 4),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 0, 255), 4)
-                break
+
+            # ── Compute 4K heading from accumulated tags ───────────────────
+            if heading_n > 0 and heading_total_w > 1e-12:
+                heading_4k_deg = math.degrees(math.atan2(sin_sum, cos_sum)) % 360
+            else:
+                heading_4k_deg = None
 
             # ── Ball colour mask ──────────────────────────────────────────
-            ball_mask_binary, ball_centroid = self._get_ball_mask(frame_ud)
+            ball_mask_binary, ball_centroid, ball_width_px = self._get_ball_mask(frame_ud)
 
             # Coloured mask overlay (semi-transparent, 40% opacity)
-            # Masked pixels shown in colour, rest darkened slightly
             mask_colour = (0, 0, 255) if self.ball_color == "Red" else (255, 100, 0)
             mask_overlay = draw_frame.copy()
             mask_overlay[ball_mask_binary > 0] = mask_colour
             draw_frame = cv2.addWeighted(draw_frame, 0.6, mask_overlay, 0.4, 0)
+
+            cam_centre_x = self._actual_w // 2
 
             if ball_centroid is not None:
                 bx, by = ball_centroid
                 cv2.circle(draw_frame, (bx, by), 20, (0, 255, 0), 4)
                 cv2.putText(draw_frame, "BALL", (bx + 25, by),
                             cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 5)
-                # If tag visible, draw horizontal line connecting ball to tag guide
-                if tag_cx is not None:
-                    cv2.line(draw_frame, (bx, by), (tag_cx, by), (0, 255, 128), 3)
 
-            # Lateral pixel error: ball X minus tag X (full-res pixels)
-            # Positive → ball is RIGHT of tag → robot LEFT of line → MOVE RIGHT
-            # Negative → ball is LEFT of tag  → robot RIGHT of line → MOVE LEFT
+            # ── CUT mode: camera-centre line + ball-offset aiming line ────
+            # CUT lateral is measured entirely in ball space, no tag needed.
+            # The robot strafes until the camera's central axis passes through
+            # the ghost-ball contact point on the coloured ball surface.
+            #
+            #   aiming_col = ball_centroid_x + cut_offset_sign * cut_sin * ball_radius_px
+            #
+            # lateral_px = aiming_col - cam_centre_x
+            #   > 0: aiming point is to the RIGHT of camera centre → MOVE RIGHT
+            #   < 0: aiming point is to the LEFT                   → MOVE LEFT
+            #
+            # Visual:
+            #   GREEN  vertical line = camera optical axis (centre of frame) = where we ARE aiming
+            #   YELLOW vertical line = desired aiming column (ghost-ball contact point)
+            #   When green == yellow → locked.
+            # ─────────────────────────────────────────────────────────────
+
             lateral_px = None
-            if ball_centroid is not None and tag_cx is not None:
-                lateral_px = ball_centroid[0] - tag_cx
+
+            if self.cut_sin > 0.0 or self.cut_offset_sign != 0.0:
+                # ── CUT MODE overlay ─────────────────────────────────────
+                # Green line = camera centre (what we're currently aiming at)
+                cv2.line(draw_frame, (cam_centre_x, 0), (cam_centre_x, self._actual_h),
+                         (0, 255, 0), 3)
+                cv2.putText(draw_frame, "AIM",
+                            (cam_centre_x + 8, self._actual_h // 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 4)
+
+                if ball_centroid is not None and ball_width_px is not None:
+                    ball_radius_px = ball_width_px / 2.0
+                    # Offset from ball centre to ghost-ball contact point (pixels)
+                    offset_px  = self.cut_offset_sign * self.cut_sin * ball_radius_px
+                    aiming_col = int(round(bx + offset_px))
+
+                    # Yellow line = where camera centre needs to be
+                    cv2.line(draw_frame, (aiming_col, 0), (aiming_col, self._actual_h),
+                             (0, 220, 255), 5)
+                    cv2.putText(draw_frame, "TARGET",
+                                (aiming_col + 8, self._actual_h * 2 // 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 220, 255), 4)
+
+                    # Small circle on the ball at the aiming contact point
+                    cv2.circle(draw_frame, (aiming_col, by), 18, (0, 220, 255), 4)
+
+                    # Width indicator — horizontal bar showing measured ball diameter
+                    half = int(ball_radius_px)
+                    bar_y = by + 35
+                    cv2.line(draw_frame, (bx - half, bar_y), (bx + half, bar_y), (200, 200, 0), 3)
+                    cv2.putText(draw_frame,
+                                f"{ball_width_px}px  r={ball_radius_px:.0f}",
+                                (bx - half, bar_y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 0), 2)
+
+                    # The signal: positive = aiming col RIGHT of cam centre → MOVE RIGHT
+                    lateral_px = aiming_col - cam_centre_x
+
+            else:
+                # ── STRAIGHT MODE overlay ─────────────────────────────────
+                # Keep tag-based alignment lines
+                if tag_cx is not None:
+                    # Horizontal connector from ball to tag guide
+                    if ball_centroid is not None:
+                        cv2.line(draw_frame, (bx, by), (tag_cx, by), (0, 255, 128), 3)
+
+                    # Magenta target line for corner shots
+                    if self.corner_offset_px != 0:
+                        target_x = int(tag_cx + self.corner_offset_px)
+                        cv2.line(draw_frame, (target_x, 0), (target_x, self._actual_h),
+                                 (255, 0, 255), 4)
+                        cv2.putText(draw_frame, "TARGET LINE",
+                                    (target_x + 10, self._actual_h // 4),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 0, 255), 4)
+
+                if ball_centroid is not None and tag_cx is not None:
+                    lateral_px = ball_centroid[0] - tag_cx
 
             # ── Downscale to half-res for display ────────────────────────
             # Use actual_w//2 × actual_h//2 so the window fits correctly at
@@ -293,17 +436,19 @@ class Sniper4kThread(threading.Thread):
             mask_bgr_small[cv2.resize(ball_mask_binary, (disp_w, disp_h)) > 0] = mask_colour
 
             with self._lock:
-                self._correction = correction
-                self._tag_found  = found
-                self._frame_720p = frame_small
-                self._mask_720p  = mask_bgr_small
-                self._lateral_px = lateral_px
+                self._heading_4k_deg   = heading_4k_deg
+                self._heading_4k_n     = heading_n
+                self._tag_found     = found
+                self._frame_720p    = frame_small
+                self._mask_720p     = mask_bgr_small
+                self._lateral_px    = lateral_px
+                self._ball_width_px = ball_width_px if ball_centroid is not None else None
 
     def get_state(self):
         with self._lock:
-            return (self._correction, self._tag_found,
+            return (self._heading_4k_deg, self._heading_4k_n, self._tag_found,
                     self._frame_720p, self._mask_720p,
-                    self._lateral_px)
+                    self._lateral_px, self._ball_width_px)
 
     def stop(self):
         self.running = False
@@ -339,61 +484,105 @@ def main():
     SHOT_MODE = "STRAIGHT" if cut_angle_deg < STRAIGHT_THRESHOLD else "CUT"
     print(f"\n[Sniper] Shot mode: {SHOT_MODE}  (cut_angle={cut_angle_deg:.1f}°)")
 
-    # ── target_relative_angle — ORIGINAL working formula ─────────────────────
-    # The detector measures actual_relative_angle = atan2(t_x, t_z).
-    # This is the angle of the tag from the camera's optical axis.
-    # target_relative_angle encodes where the tag SHOULD appear in camera frame
-    # when the robot is correctly positioned and facing the firing direction.
-    #
-    # Original formula (proven working before any offset changes):
-    #   dx = px - rx  (real pocket - robot plan position)
-    #   dy = py - ry
-    #   target_world_angle = atan2(dy, dx)   ← standard math convention
-    #   target_relative_angle = target_world_angle - fire_angle_deg
-    #
-    # fire_angle_deg from the planner now encodes the OFFSET firing direction
-    # (toward the effective pocket) for corner shots. Because of this, tra
-    # automatically becomes the correct non-zero target that the camera will
-    # measure when pointing at the effective pocket. No other changes needed.
-    dx = px - rx
-    dy = py - ry
-    target_world_angle    = math.degrees(math.atan2(dy, dx))
-    target_relative_angle = target_world_angle - fire_angle_deg
-    target_relative_angle = (target_relative_angle + 180) % 360 - 180
-    print(f"[Sniper] target_relative_angle: {target_relative_angle:.4f}°")
+    # ── Target heading = fire direction the robot must achieve ───────────────
+    # The robot must face fire_angle_deg (world frame) to execute the shot.
+    # heading_error = fire_angle_deg - actual_heading_deg  (normalised ±180°)
+    # positive = robot facing too far LEFT  → TURN RIGHT (vR > 0)
+    # negative = robot facing too far RIGHT → TURN LEFT  (vR < 0)
+    target_heading_deg = fire_angle_deg
+    print(f"[Sniper] Target heading: {target_heading_deg:.2f}°  (fire_angle from planner)")
 
-    # Lateral sensitivity geometry inputs (depth values for STRAIGHT mode)
+    # Lateral sensitivity geometry inputs
     tag_world_y_mm = KNOWN_TAGS[target_tag_id]["y"] * 1000.0
     ball_depth_mm  = ry - ball_xy[1]         # ry - ball_y_mm
     tag_depth_mm   = ry - tag_world_y_mm     # ry - tag_y_mm
     rx_m = rx / 1000.0                       # metres, for HD X-error display
 
+    # ── CUT offset parameters ─────────────────────────────────────────────────
+    # For CUT mode, the lateral signal is entirely ball-based (no tag needed):
+    #   aiming_col = ball_centroid_x + cut_offset_sign × sin(cut_angle) × ball_radius_px
+    #   lateral_error = aiming_col - cam_centre_x
+    # cut_offset_sign encodes WHICH SIDE of the ball to aim at.
+    # We derive it from the ghost_ball position relative to the ball, projected
+    # onto the camera's lateral (right) axis at the plan firing heading.
+    #
+    # Ghost ball is always one ball-diameter away from the ball in the direction
+    # OPPOSITE to the pocket — this is the surface contact point we aim at.
+    cut_offset_sign = 0.0
+    cut_sin         = 0.0
+    if SHOT_MODE == "CUT":
+        fire_rad   = math.radians(fire_angle_deg)
+        cos_f      = math.cos(fire_rad)
+        sin_f      = math.sin(fire_rad)
+        right_x    = -sin_f
+        right_y    =  cos_f
+        ghost_x    = float(target_data["ghost_ball_xy"][0])
+        ghost_y    = float(target_data["ghost_ball_xy"][1])
+        ball_x_mm  = float(ball_xy[0])
+        ball_y_mm  = float(ball_xy[1])
+        # Camera-lateral component of the ghost-ball offset from ball centre
+        goff_x     = ghost_x - ball_x_mm
+        goff_y     = ghost_y - ball_y_mm
+        cam_lat_of_ghost = goff_x * right_x + goff_y * right_y   # mm
+        cut_offset_sign  = 1.0 if cam_lat_of_ghost >= 0.0 else -1.0
+        cut_sin          = math.sin(math.radians(cut_angle_deg))
+        print(f"[Sniper] CUT offset: sign={cut_offset_sign:+.0f}  "
+              f"sin({cut_angle_deg:.1f}°)={cut_sin:.4f}  "
+              f"(ghost cam-lateral: {cam_lat_of_ghost:+.1f}mm)")
+
     # ── Start 4K thread ─────────────────────────────────────────────────────
-    sniper_thread = Sniper4kThread(target_tag_id, target_relative_angle, ball_color,
-                                   corner_offset_px=0.0)
+    sniper_thread = Sniper4kThread(
+        target_tag_id, ball_color,
+        corner_offset_px=0.0,
+        cut_offset_sign=cut_offset_sign,
+        cut_sin=cut_sin,
+    )
     sniper_thread.start()
 
     # Compute lateral sensitivity now that thread has opened the camera
     fx_4k = sniper_thread.camera_params_4k[0]
-    if ball_depth_mm > 0 and tag_depth_mm > 0:
-        lateral_sens   = fx_4k * (1.0/ball_depth_mm - 1.0/tag_depth_mm)
-        lateral_acc_mm = LATERAL_TOL_PX / abs(lateral_sens)
-    else:
-        lateral_sens   = 1.0
-        lateral_acc_mm = 99.9
-    print(f"[Sniper] Lateral sensitivity: {abs(lateral_sens):.3f} px/mm  "
-          f"(tol={LATERAL_TOL_PX}px → ±{lateral_acc_mm:.1f}mm)")
 
-    # Compute corner_offset_px using actual fx, then update thread's guide line
-    CORNER_TAGS_SIGN = {3: +1, 5: -1}   # Hole_3 = left corner (+X), Hole_5 = right (−X)
-    if SHOT_MODE == "STRAIGHT" and target_tag_id in CORNER_TAGS_SIGN and CORNER_OFFSET_MM != 0:
-        corner_sign       = CORNER_TAGS_SIGN[target_tag_id]
-        target_lateral_px = corner_sign * (fx_4k * CORNER_OFFSET_MM / tag_depth_mm)
-        sniper_thread.corner_offset_px = target_lateral_px
-        print(f"[Sniper] Corner offset px: {target_lateral_px:+.1f} px  "
-              f"({'RIGHT' if corner_sign>0 else 'LEFT'} of tag center)")
+    if SHOT_MODE == "STRAIGHT":
+        # STRAIGHT: sensitivity = how much ball-tag pixel separation changes per mm
+        # (ball moves more than tag per mm because ball is closer)
+        if ball_depth_mm > 0 and tag_depth_mm > 0:
+            lateral_sens   = fx_4k * (1.0/ball_depth_mm - 1.0/tag_depth_mm)
+            lateral_acc_mm = LATERAL_TOL_PX / abs(lateral_sens) if abs(lateral_sens) > 1e-9 else 99.9
+        else:
+            lateral_sens   = 1.0
+            lateral_acc_mm = 99.9
+        print(f"[Sniper] Lateral sensitivity (STRAIGHT): {abs(lateral_sens):.3f} px/mm  "
+              f"(tol={LATERAL_TOL_PX}px → ±{lateral_acc_mm:.1f}mm)")
     else:
-        target_lateral_px = 0.0
+        # CUT: signal is purely ball-based (cam_centre vs aiming_col).
+        # Sensitivity = how much aiming_col shifts per mm of robot lateral movement.
+        # When robot moves 1mm laterally, ball shifts by fx/ball_depth pixels in the image.
+        # (The aiming point offset_px scales with ball_width, which barely changes,
+        #  so the dominant term is just the ball shifting in the frame.)
+        if ball_depth_mm > 0:
+            lateral_sens   = fx_4k / ball_depth_mm   # px per mm
+            lateral_acc_mm = LATERAL_TOL_PX / lateral_sens if lateral_sens > 1e-9 else 99.9
+        else:
+            lateral_sens   = 1.0
+            lateral_acc_mm = 99.9
+        print(f"[Sniper] Lateral sensitivity (CUT): {lateral_sens:.3f} px/mm  "
+              f"(ball_depth={ball_depth_mm:.0f}mm, tol={LATERAL_TOL_PX}px → ±{lateral_acc_mm:.1f}mm)")
+
+    # ── target_lateral_px: used only for STRAIGHT mode ───────────────────────
+    # CUT mode has no fixed target — it recomputes each frame from ball width.
+    CORNER_TAGS_SIGN = {3: +1, 5: -1}   # Hole_3 = left corner (+X), Hole_5 = right (−X)
+
+    if SHOT_MODE == "STRAIGHT":
+        if target_tag_id in CORNER_TAGS_SIGN and CORNER_OFFSET_MM != 0:
+            corner_sign       = CORNER_TAGS_SIGN[target_tag_id]
+            target_lateral_px = corner_sign * (fx_4k * CORNER_OFFSET_MM / tag_depth_mm)
+            sniper_thread.corner_offset_px = target_lateral_px
+            print(f"[Sniper] Corner offset px: {target_lateral_px:+.1f} px  "
+                  f"({'RIGHT' if corner_sign>0 else 'LEFT'} of tag center)")
+        else:
+            target_lateral_px = 0.0
+    else:
+        target_lateral_px = 0.0   # not used for CUT
 
     # ── HD camera (position — 30fps) ─────────────────────────────────────────
     if sys.platform.startswith('win'):
@@ -430,9 +619,10 @@ def main():
     print(f"\n[Sniper] Target pocket : {target_pocket}  (Tag {target_tag_id})")
     print(f"[Sniper] Required X    : {rx:.1f} mm")
     print(f"[Sniper] Required Y    : {ry:.1f} mm")
-    print(f"[Sniper] Target angle  : {target_relative_angle:.2f}°")
+    print(f"[Sniper] Target heading: {target_heading_deg:.2f}°  (fire_angle)")
+    print(f"[Sniper] HD+4K weight  : 4K={SNIPER_4K_HEADING_WEIGHT:.2f}  HD={1-SNIPER_4K_HEADING_WEIGHT:.2f}")
     print(f"[Sniper] HD cam  → position (X, Y, heading) at 30fps")
-    print(f"[Sniper] 4K cam  → angle correction (threaded, non-blocking)")
+    print(f"[Sniper] 4K cam  → heading from ALL visible tags (threaded)")
 
     # ── Telemetry broadcast socket (same port as new_main3 — mission_controller ──
     # listens here while sniper is active).  Uses the same packet format as
@@ -558,9 +748,13 @@ def main():
             # ── Apply calibration BEFORE the low-pass filter ───────────────
             # Must be here — applying after smoothing compounds the scale
             # factor every frame and causes position drift (same bug as new_main3).
-            # X/Y scale + offset
+            # Step 1: global linear correction
             raw_x  = _CAL["scale_x"] * raw_x  + _CAL["offset_x_m"]
             raw_y  = _CAL["scale_y"] * raw_y  + _CAL["offset_y_m"]
+            # Step 2: IDW residual correction (local zone errors)
+            _res_x, _res_y = _idw_position_correction(raw_x, raw_y)
+            raw_x += _res_x
+            raw_y += _res_y
             # Heading IDW correction (position-dependent)
             _raw_h  = math.degrees(math.atan2(raw_dy, raw_dx)) % 360
             _h_corr = _idw_heading_correction(raw_x, raw_y)
@@ -611,7 +805,39 @@ def main():
         # ════════════════════════════════════════════════════════════════════
         # 2. FETCH LATEST 4K RESULTS  (non-blocking — last result from thread)
         # ════════════════════════════════════════════════════════════════════
-        correction, tag_found_4k, frame_4k_720p, mask_720p, lateral_px = sniper_thread.get_state()
+        heading_4k_deg, heading_4k_n, tag_found_4k, frame_4k_720p, mask_720p, lateral_px, ball_width_px = sniper_thread.get_state()
+
+        # ════════════════════════════════════════════════════════════════════
+        # 2b. BLEND 4K + HD HEADINGS → correction
+        # ════════════════════════════════════════════════════════════════════
+        # HD heading from the smoothed tracker
+        hd_heading_deg = math.degrees(math.atan2(last_dy, last_dx)) % 360 if initialized else None
+
+        if heading_4k_deg is not None and hd_heading_deg is not None:
+            # Circular-average blend of 4K and HD headings
+            w4k = SNIPER_4K_HEADING_WEIGHT
+            whd = 1.0 - SNIPER_4K_HEADING_WEIGHT
+            sx = w4k * math.cos(math.radians(heading_4k_deg)) + whd * math.cos(math.radians(hd_heading_deg))
+            sy = w4k * math.sin(math.radians(heading_4k_deg)) + whd * math.sin(math.radians(hd_heading_deg))
+            blended_heading_deg = math.degrees(math.atan2(sy, sx)) % 360
+            source_str = f"4K({heading_4k_n}tags)×{w4k:.2f}+HD×{whd:.2f}"
+        elif heading_4k_deg is not None:
+            blended_heading_deg = heading_4k_deg
+            source_str = f"4K only ({heading_4k_n} tags)"
+        elif hd_heading_deg is not None:
+            blended_heading_deg = hd_heading_deg
+            source_str = "HD only"
+        else:
+            blended_heading_deg = None
+            source_str = "NO HEADING"
+
+        # correction = how many degrees the robot needs to rotate
+        # positive = TURN RIGHT (increase heading); negative = TURN LEFT
+        if blended_heading_deg is not None:
+            raw_correction = target_heading_deg - blended_heading_deg
+            correction = (raw_correction + 180) % 360 - 180
+        else:
+            correction = 0.0
 
         # ════════════════════════════════════════════════════════════════════
         # 3. COMPUTE ERRORS
@@ -621,35 +847,35 @@ def main():
             x_error = last_x * 1000.0 - rx   # mm
             y_error = last_y * 1000.0 - ry   # mm
         else:
-            x_error = 999.0
-            y_error = 999.0
+            x_error = 0.0
+            y_error = 0.0
 
-        ang_locked = tag_found_4k and abs(correction) < ANGLE_LOCK_DEG
+        ang_locked = (blended_heading_deg is not None) and abs(correction) < ANGLE_LOCK_DEG
 
-        if SHOT_MODE == "STRAIGHT":
-            # STEP 1 — ANGLE: correction ≈ 0  (TURN LEFT / TURN RIGHT)
-            # STEP 2 — LATERAL: lateral_px ≈ target_lateral_px  (MOVE LEFT / MOVE RIGHT)
-            #   lateral_px = ball_centroid_x - tag_center_x  (full-res pixels)
-            #   target_lateral_px = 0 for center shots, ±offset for corner shots
-            #   lateral_error_px = lateral_px - target_lateral_px
-            #   > 0: need to MOVE RIGHT  (robot is left of ideal line)
-            #   < 0: need to MOVE LEFT   (robot is right of ideal line)
+        if SHOT_MODE == "STRAIGHT" or SHOT_MODE == "CUT":
+            # ── ANGLE: correction → rotate (vR) ──────────────────────────────
+            # Identical for both modes.
+            #
+            # ── LATERAL: pixel error → strafe (vX) ───────────────────────────
+            # STRAIGHT: lateral_px = ball_cx - tag_cx
+            #           lateral_error = lateral_px - target_lateral_px
+            #           target_lateral_px = 0 (or corner offset)
+            #
+            # CUT:      lateral_px = aiming_col - cam_centre_x  (computed in thread)
+            #           aiming_col = ball_cx + cut_offset_sign × sin(cut°) × ball_radius_px
+            #           lateral_error = lateral_px  (target is already zero — thread does it)
+            #           i.e., when the thread outputs lateral_px=0 the camera centre IS
+            #           on the ghost-ball contact point.
+            #
+            # Both paths feed the same vX logic in mission_controller.
             if lateral_px is not None:
-                lateral_error_px = lateral_px - target_lateral_px
-                lateral_mm = lateral_error_px / lateral_sens   # mm, + = MOVE RIGHT
+                lateral_error_px = lateral_px - target_lateral_px   # 0 for CUT (target=0)
+                lateral_mm = lateral_error_px / lateral_sens if abs(lateral_sens) > 1e-9 else None
                 lat_locked = abs(lateral_error_px) < LATERAL_TOL_PX
             else:
                 lateral_mm = None
                 lat_locked = False
             pos_locked = ang_locked and lat_locked
-
-        else:
-            # CUT: HD X/Y + 4K angle each checked independently
-            x_ok = initialized and abs(x_error) < 5.0
-            y_ok = initialized and abs(y_error) < 10.0
-            pos_locked = x_ok and y_ok
-            lateral_mm = None
-            lat_locked = False
 
         print(f"before broadcast initialized is : {initialized} | x_error={x_error:.1f} | y_error={y_error:.1f} | state={state_text}")
 
@@ -670,10 +896,16 @@ def main():
             "target_zone":   target_data.get("target_ball_zone", "?"),
             "ball_color":    ball_color,
             "tag_found_4k":  bool(tag_found_4k),
-            "ang_correction_deg": round(correction, 3) if tag_found_4k else None,
+            "heading_4k_deg":     round(heading_4k_deg, 2) if heading_4k_deg is not None else None,
+            "heading_4k_n_tags":  heading_4k_n,
+            "heading_hd_deg":     round(hd_heading_deg, 2) if hd_heading_deg is not None else None,
+            "blended_heading_deg": round(blended_heading_deg, 2) if blended_heading_deg is not None else None,
+            "target_heading_deg": round(target_heading_deg, 2),
+            "ang_correction_deg": round(correction, 3) if blended_heading_deg is not None else None,
             "ang_locked":    bool(ang_locked),
             "lateral_mm":    round(lateral_mm, 1) if lateral_mm is not None else None,
             "lat_locked":    bool(lat_locked),
+            "ball_width_px": ball_width_px,
             "x_error_mm":    round(x_error, 1),
             "y_error_mm":    round(y_error, 1),
             "pos_locked":    bool(pos_locked),
@@ -726,14 +958,15 @@ def main():
 
             # ── STEP 1: Angle ────────────────────────────────────────────────
             step1_locked = ang_locked
-            s1_col = (0, 255, 0) if step1_locked else (255, 255, 0)
-            cv2.putText(hud, "STEP 1 — ANGLE",
-                        (30, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (180, 180, 180), 2)
-            if not tag_found_4k:
-                cv2.putText(hud, f"Searching for Tag {target_tag_id}...",
+            hdg_info = (f"  (now {blended_heading_deg:.1f}° → {target_heading_deg:.1f}°  {source_str})"
+                        if blended_heading_deg is not None else "  (no heading)")
+            cv2.putText(hud, f"STEP 1 — HEADING{hdg_info}",
+                        (30, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 180, 180), 2)
+            if blended_heading_deg is None:
+                cv2.putText(hud, "No heading estimate (no tags visible)",
                             (30, 130), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 0, 255), 3)
             elif step1_locked:
-                cv2.putText(hud, f"ANGLE OK  ({correction:+.2f}°)",
+                cv2.putText(hud, f"HEADING OK  ({correction:+.2f}°)",
                             (30, 130), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 4)
             else:
                 d = "RIGHT" if correction > 0 else "LEFT"
@@ -773,50 +1006,64 @@ def main():
 
         else:
             # ────────────────────────────────────────────────────────────────
-            # CUT MODE HUD  (unchanged behaviour)
-            # Shows X error, Y error, and angle error independently.
+            # CUT MODE HUD — same two-step display as STRAIGHT.
+            # Step 1: Angle (heading toward firing direction via AprilTag).
+            # Step 2: Lateral (ball aligned to ghost-ball offset target).
+            #
+            # The magenta TARGET LINE on the 4K view shows where the ball
+            # centre needs to be (offset from the tag guide by target_lateral_px).
+            # When the coloured ball centroid sits on the magenta line and the
+            # angle is green, the robot is aimed at the ghost-ball contact point.
             # ────────────────────────────────────────────────────────────────
-            track_col = (0,255,0) if state_text=="STILL" else (0,165,255) if state_text=="TRANSITIONING" else (0,0,255)
-            cv2.putText(hud, f"HD: {state_text}",
-                        (30, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.9, track_col, 2)
 
-            x_col = (0, 255, 0) if (initialized and abs(x_error) < 5.0)  else (255, 255, 0)
-            y_col = (0, 255, 0) if (initialized and abs(y_error) < 10.0) else (255, 255, 0)
-            a_col = (0, 255, 0) if ang_locked else (255, 255, 0)
+            cut_info = f"  ({cut_angle_deg:.0f}° cut  offset={cut_offset_sign*cut_sin*100:.0f}% radius)"
 
-            cv2.putText(hud, f"X Error [HD]: {x_error:+.1f} mm" if initialized else "X Error [HD]: ---",
-                        (30, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.2, x_col, 3)
-            cv2.putText(hud, f"Y Error [HD]: {y_error:+.1f} mm" if initialized else "Y Error [HD]: ---",
-                        (30, 194), cv2.FONT_HERSHEY_SIMPLEX, 1.2, y_col, 3)
-            cv2.putText(hud,
-                        f"Angle  [4K]: {correction:+.2f}°" if tag_found_4k else "Angle [4K]: SEARCHING...",
-                        (30, 240), cv2.FONT_HERSHEY_SIMPLEX, 1.2, a_col, 3)
-
-            y_off = 308
-            if pos_locked and ang_locked:
-                cv2.putText(hud, "LOCKED!  PRESS 'f' TO FIRE",
-                            (30, y_off), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 255, 0), 5)
+            # ── STEP 1: Heading ───────────────────────────────────────────────
+            hdg_info = (f"  (now {blended_heading_deg:.1f}° → {target_heading_deg:.1f}°  {source_str})"
+                        if blended_heading_deg is not None else "  (no heading)")
+            cv2.putText(hud, f"STEP 1 — HEADING{cut_info}",
+                        (30, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 180, 180), 2)
+            cv2.putText(hud, hdg_info,
+                        (30, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (140, 140, 140), 1)
+            if blended_heading_deg is None:
+                cv2.putText(hud, "No heading estimate (no tags visible)",
+                            (30, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 0, 255), 3)
+            elif ang_locked:
+                cv2.putText(hud, f"HEADING OK  ({correction:+.2f}°)",
+                            (30, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 4)
             else:
-                if initialized and abs(x_error) >= 5.0:
-                    d = "LEFT" if x_error > 0 else "RIGHT"
-                    cv2.putText(hud, f"SHIFT {d}: {abs(x_error):.1f} mm",
-                                (30, y_off), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 165, 255), 4)
-                    y_off += 55
-                if initialized and abs(y_error) >= 10.0:
-                    d = "FORWARD" if y_error > 0 else "BACK"
-                    cv2.putText(hud, f"MOVE {d}: {abs(y_error):.1f} mm",
-                                (30, y_off), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 165, 255), 4)
-                    y_off += 55
-                if not ang_locked and tag_found_4k:
-                    d = "RIGHT" if correction > 0 else "LEFT"
-                    cv2.putText(hud, f"TURN {d}: {abs(correction):.2f}°",
-                                (30, y_off), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 165, 255), 4)
-                elif not tag_found_4k:
-                    cv2.putText(hud, f"SEARCHING FOR TAG {target_tag_id}...",
-                                (30, y_off), cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 255), 4)
-            if not initialized:
-                cv2.putText(hud, "HD TRACKING LOST",
-                            (30, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+                d = "RIGHT" if correction > 0 else "LEFT"
+                cv2.putText(hud, f"TURN {d}:  {abs(correction):.2f}°",
+                            (30, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 165, 255), 5)
+
+            # Divider
+            cv2.line(hud, (20, 148), (660, 148), (60, 60, 60), 1)
+
+            # ── STEP 2: Lateral ──────────────────────────────────────────────
+            cv2.putText(hud, "STEP 2 — AIM AT GHOST BALL  (after angle is set)",
+                        (30, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 180, 180), 2)
+            if lateral_mm is None:
+                no_ball_msg = "Ball not detected" if tag_found_4k else "Waiting for tag..."
+                cv2.putText(hud, no_ball_msg,
+                            (30, 218), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (100, 100, 100), 2)
+            elif lat_locked:
+                cv2.putText(hud, f"AIM OK  ({lateral_mm:+.1f} mm)",
+                            (30, 218), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 4)
+            else:
+                d = "RIGHT" if lateral_mm > 0 else "LEFT"
+                cv2.putText(hud, f"MOVE {d}:  {abs(lateral_mm):.1f} mm",
+                            (30, 218), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 165, 255), 5)
+
+            # ── Lock banner ──────────────────────────────────────────────────
+            if pos_locked and ang_locked:
+                cv2.rectangle(hud, (0, 238), (1280, 310), (0, 70, 0), -1)
+                cv2.putText(hud, "LOCKED!  PRESS 'f' TO FIRE",
+                            (30, 295), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 255, 0), 5)
+
+            # HD state — tiny info at bottom
+            track_col = (0,200,0) if state_text=="STILL" else (0,140,200) if state_text=="TRANSITIONING" else (0,0,180)
+            hd_txt = f"HD: {state_text}  X={x_error:+.0f}mm  Y={y_error:+.0f}mm" if initialized else f"HD: {state_text}"
+            cv2.putText(hud, hd_txt, (15, disp_h - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, track_col, 1)
 
         if HAS_DISPLAY:
             cv2.namedWindow("4K Sniper View", cv2.WINDOW_NORMAL)
@@ -893,22 +1140,17 @@ def main():
                 robot_map_pt = world_to_pixel(last_x, last_y)
                 cv2.line(map_canvas, robot_map_pt, tag_map_pt, (0, 200, 255), 2)
         else:
-            # CUT: show target position dot + X/Y tolerance bands
+            # CUT: draw a line from target robot position through ghost_ball to pocket.
+            # This shows the intended shot geometry on the map.
+            cv2.circle(map_canvas, ghost_pt, 6, (255, 255, 255), 2)
+            cv2.line(map_canvas, tgt_pt, ghost_pt, (255, 255, 100), 2)
+            cv2.line(map_canvas, ghost_pt, pocket_pt, (255, 200, 0), 2)
+            cv2.putText(map_canvas, "GHOST", (ghost_pt[0]+6, ghost_pt[1]-6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+            # Draw target position dot
             cv2.circle(map_canvas, tgt_pt, 5, mode_col_map, -1)
             cv2.putText(map_canvas, "TARGET", (tgt_pt[0]+8, tgt_pt[1]-8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, mode_col_map, 1)
-            cv2.line(map_canvas,
-                     world_to_pixel(rx/1000.0 - 0.005, ry/1000.0 - 0.02),
-                     world_to_pixel(rx/1000.0 - 0.005, ry/1000.0 + 0.02), mode_col_map, 2)
-            cv2.line(map_canvas,
-                     world_to_pixel(rx/1000.0 + 0.005, ry/1000.0 - 0.02),
-                     world_to_pixel(rx/1000.0 + 0.005, ry/1000.0 + 0.02), mode_col_map, 2)
-            cv2.line(map_canvas,
-                     world_to_pixel(rx/1000.0 - 0.025, ry/1000.0 - 0.010),
-                     world_to_pixel(rx/1000.0 + 0.025, ry/1000.0 - 0.010), mode_col_map, 2)
-            cv2.line(map_canvas,
-                     world_to_pixel(rx/1000.0 - 0.025, ry/1000.0 + 0.010),
-                     world_to_pixel(rx/1000.0 + 0.025, ry/1000.0 + 0.010), mode_col_map, 2)
 
         # Mode label on map
         cv2.putText(map_canvas, SHOT_MODE, (PADDING, CANVAS_H - PADDING + 20),

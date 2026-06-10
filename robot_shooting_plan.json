@@ -1,21 +1,21 @@
 {
-    "F": {
-        "color": "Blue",
-        "target_ball_zone": "F",
+    "G": {
+        "color": "Red",
+        "target_ball_zone": "G",
         "target_ball_real_xy": [
-            800,
+            1000,
             300
         ],
-        "target_pocket": "Hole_4",
+        "target_pocket": "Hole_5",
         "ghost_ball_xy": [
-            829.12,
-            343.68
+            973.55,
+            345.35
         ],
         "robot_alignment_xy": [
-            945.0,
+            325.0,
             2450
         ],
-        "firing_angle_deg": 266.9,
-        "cut_angle_deg": 30.5
+        "firing_angle_deg": 287.1,
+        "cut_angle_deg": 13.1
     }
 }
