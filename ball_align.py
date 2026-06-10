@@ -39,6 +39,8 @@ import threading
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from pathlib import Path
+
 from config import (
     CAM_BACK,
     TELEMETRY_PORT,
@@ -59,14 +61,14 @@ HAS_DISPLAY = bool(os.environ.get("DISPLAY"))
 
 # White ball HSV thresholds.
 # White = very low saturation, very high brightness.
-BALL_WHITE_S_MAX  = 70    # max saturation to count as white
-BALL_WHITE_V_MIN  = 150   # min brightness to count as white
+BALL_WHITE_S_MAX  = 80    # max saturation to count as white
+BALL_WHITE_V_MIN  = 100   # min brightness to count as white
 
 # Blue podium HSV thresholds.
 # Used to reject white blobs that are NOT above blue (e.g. white floor).
 BLUE_H_MIN, BLUE_H_MAX = 95,  135
 BLUE_S_MIN, BLUE_S_MAX = 100, 255
-BLUE_V_MIN, BLUE_V_MAX = 60,  230
+BLUE_V_MIN, BLUE_V_MAX = 40,  230
 
 # Fraction of frame height to search for balls.
 # Ignore the bottom portion to avoid seeing the white floor.
@@ -85,7 +87,7 @@ MIN_BALL_AREA_PX = 3000
 # From image 1 (backed up): ball fills ~40% of frame → ~0.4 * 640*480 ≈ 120,000px
 # From image 2 (aligned):   ball fills ~50% of frame edge → much larger
 # Start conservative:
-AREA_CLOSE_THRESHOLD = 280_000   # px² — tune upward if robot stops too far away
+AREA_CLOSE_THRESHOLD = 250000   # px² — tune upward if robot stops too far away
 
 # Lateral tolerance: ball centroid within this many pixels of frame centre = aligned.
 LATERAL_TOL_PX_ALIGN = 30    # px
@@ -436,6 +438,8 @@ class BallAlignState:
                     self._data = data
             except (socket.timeout, json.JSONDecodeError):
                 pass
+            except OSError:
+                break
 
     def get(self) -> dict:
         with self._lock:
@@ -531,7 +535,9 @@ def do_ball_align(mc, align_state: BallAlignState,
     if verbose:
         print("[ball_align] Starting alignment...")
 
+    stable = 0
     t0 = time.time()
+    loss_time = None
     while time.time() - t0 < timeout:
         st = align_state.get()
 
@@ -554,9 +560,20 @@ def do_ball_align(mc, align_state: BallAlignState,
                   f"{'✓ ALIGNED' if st.get('aligned') else ''}")
 
         if st.get("aligned"):
-            mc.brake()
-            if verbose: print("[ball_align] Aligned!")
-            return True
+            if loss_time and time.time() - loss_time < 1.0:
+                print("[ball_align] Alignment After Loss Rejected!")
+                stable = 0
+            elif time.time() - t0 < 0.75:
+                print("[ball_align] Alignment After Start Rejected!")
+                stable = 0
+            else:
+                stable += 1
+                if stable >= 5:
+                    mc.brake()
+                    if verbose: print("[ball_align] Aligned!")
+                    return True
+        else:
+            stable = 0
 
         x_cmd    = st.get("x_cmd", "STOP")
         y_cmd    = st.get("y_cmd", "STOP")
@@ -567,6 +584,7 @@ def do_ball_align(mc, align_state: BallAlignState,
 
         if not st.get("ball_found") and not ped_mode:
             # Completely lost — stop and wait
+            loss_time = time.time()
             mc.brake()
             time.sleep(0.05)
             continue

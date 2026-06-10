@@ -90,7 +90,7 @@ def pose_similarity(new_pose, old_pose, image_width, image_height):
 
 def main():
     CHECKERBOARD_SIZE = (9, 6)
-    SQUARE_SIZE_METERS = 0.020
+    SQUARE_SIZE_METERS = 0.028
 
     TARGET_FRAMES = 100
     SIMILARITY_THRESHOLD = 0.90
