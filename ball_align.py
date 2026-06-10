@@ -90,9 +90,15 @@ AREA_CLOSE_THRESHOLD = 280_000   # px² — tune upward if robot stops too far a
 # Lateral tolerance: ball centroid within this many pixels of frame centre = aligned.
 LATERAL_TOL_PX_ALIGN = 30    # px
 
+# Pedestal-fallback lateral tolerance — slightly looser than for the ball itself.
+# When no white ball is visible we just want the pedestal roughly centred so the
+# ball will appear once the robot slides into range.
+PEDESTAL_LATERAL_TOL_PX = 60   # px — tune looser than LATERAL_TOL_PX_ALIGN
+
 # Movement speeds for alignment (sent to movement_server via UDP)
 ALIGN_STRAFE_POWER = 50   # power for LEFT/RIGHT strafe during alignment
 ALIGN_BACK_POWER   = 200   # power for BACK movement during alignment
+ALIGN_PEDESTAL_STRAFE_POWER = 40  # power when strafing toward pedestal (slower, gentler)
 
 # Broadcast port for ball_align telemetry
 # We reuse TELEMETRY_PORT but add ball_align_* fields so mission_controller
@@ -212,54 +218,157 @@ def detect_ball(frame_bgr):
     }
 
 
-def compute_align_state(detection):
+def detect_pedestal(frame_bgr):
     """
-    Given a ball detection, compute the alignment state.
+    Find the blue pedestal in the frame when no white ball is visible.
+
+    Used as a fallback: if the robot can't see the white ball yet (e.g. it's
+    off to one side), centring the blue pedestal laterally will slide the robot
+    until the white ball appears above it.
 
     Returns dict with:
-      lateral_ok:    bool — horizontally centred enough
-      distance_ok:   bool — close enough to ball
-      aligned:       bool — both lateral and distance OK
-      lateral_err_px: signed pixel error (+ = ball right of centre)
-      area:          white blob area in pixels
-      distance_state: "FAR" | "CLOSE"
-      x_cmd:         "LEFT" | "RIGHT" | "STOP" (strafe command)
-      y_cmd:         "BACK" | "STOP"  (back = toward ball)
+      centroid_x, centroid_y: pixel coords of pedestal blob centre
+      area:                   pixel area of blue blob
+      frame_w, frame_h:       frame dimensions
+      lateral_err_px:         centroid_x - frame_w/2  (+ = pedestal right of centre)
+    or None if no blue region found.
     """
-    if detection is None:
-        return {
-            "lateral_ok": False, "distance_ok": False, "aligned": False,
-            "lateral_err_px": None, "area": 0,
-            "distance_state": "LOST",
-            "x_cmd": "STOP", "y_cmd": "STOP",
-            "ball_found": False,
-        }
+    h, w = frame_bgr.shape[:2]
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
-    lat_err = detection["lateral_err_px"]
-    area    = detection["area"]
+    blue_mask = cv2.inRange(
+        hsv,
+        np.array([BLUE_H_MIN, BLUE_S_MIN, BLUE_V_MIN]),
+        np.array([BLUE_H_MAX, BLUE_S_MAX, BLUE_V_MAX]),
+    )
 
-    lateral_ok  = abs(lat_err) < LATERAL_TOL_PX_ALIGN
-    distance_ok = area >= AREA_CLOSE_THRESHOLD
+    # Clean noise
+    kernel = np.ones((7, 7), np.uint8)
+    blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN,  kernel, iterations=1)
+    blue_mask = cv2.morphologyEx(blue_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    if lat_err > LATERAL_TOL_PX_ALIGN:
-        x_cmd = "LEFT"
-    elif lat_err < -LATERAL_TOL_PX_ALIGN:
-        x_cmd = "RIGHT"
-    else:
-        x_cmd = "STOP"
+    contours, _ = cv2.findContours(blue_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
 
-    y_cmd = "STOP" if distance_ok else "BACK"
+    # Pick largest blue blob
+    best = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(best)
+    if area < 2000:   # ignore tiny blue specks
+        return None
+
+    M = cv2.moments(best)
+    if M["m00"] < 1:
+        return None
+    cx = int(M["m10"] / M["m00"])
+    cy = int(M["m01"] / M["m00"])
+    bx, by, bw, bh = cv2.boundingRect(best)
 
     return {
-        "ball_found":    True,
-        "lateral_ok":    lateral_ok,
-        "distance_ok":   distance_ok,
-        "aligned":       lateral_ok and distance_ok,
-        "lateral_err_px": lat_err,
+        "centroid_x":    cx,
+        "centroid_y":    cy,
         "area":          int(area),
-        "distance_state": "CLOSE" if distance_ok else "FAR",
-        "x_cmd":         x_cmd,
-        "y_cmd":         y_cmd,
+        "width_px":      bw,
+        "height_px":     bh,
+        "bbox":          (bx, by, bw, bh),
+        "frame_w":       w,
+        "frame_h":       h,
+        "lateral_err_px": cx - w // 2,
+        "blue_mask":     blue_mask,
+    }
+
+
+def compute_align_state(detection, pedestal=None):
+    """
+    Given a ball detection (and optionally a pedestal detection as fallback),
+    compute the alignment state.
+
+    Priority:
+      1. White ball found → align to ball exactly as before (lateral + distance).
+      2. No white ball, but blue pedestal visible → align pedestal to centre
+         laterally only (no back/forward command).  Distance is never "OK"
+         in this mode; we are just sliding until the ball appears.
+      3. Nothing found → LOST.
+
+    Returns dict with:
+      ball_found:     bool — a white ball is being tracked
+      pedestal_mode:  bool — using pedestal as fallback (no ball yet)
+      lateral_ok:     bool — horizontally centred enough
+      distance_ok:    bool — close enough (always False in pedestal mode)
+      aligned:        bool — both lateral and distance OK (False in pedestal mode)
+      lateral_err_px: signed pixel error (+ = target right of centre)
+      area:           white blob area (0 in pedestal mode)
+      distance_state: "FAR" | "CLOSE" | "LOST" | "PEDESTAL"
+      x_cmd:          "LEFT" | "RIGHT" | "STOP"
+      y_cmd:          "BACK" | "STOP"
+    """
+    # ── Case 1: white ball visible ─────────────────────────────────────────────
+    if detection is not None:
+        lat_err = detection["lateral_err_px"]
+        area    = detection["area"]
+
+        lateral_ok  = abs(lat_err) < LATERAL_TOL_PX_ALIGN
+        distance_ok = area >= AREA_CLOSE_THRESHOLD
+
+        if lat_err > LATERAL_TOL_PX_ALIGN:
+            x_cmd = "LEFT"
+        elif lat_err < -LATERAL_TOL_PX_ALIGN:
+            x_cmd = "RIGHT"
+        else:
+            x_cmd = "STOP"
+
+        y_cmd = "STOP" if distance_ok else "BACK"
+
+        return {
+            "ball_found":    True,
+            "pedestal_mode": False,
+            "lateral_ok":    lateral_ok,
+            "distance_ok":   distance_ok,
+            "aligned":       lateral_ok and distance_ok,
+            "lateral_err_px": lat_err,
+            "area":          int(area),
+            "distance_state": "CLOSE" if distance_ok else "FAR",
+            "x_cmd":         x_cmd,
+            "y_cmd":         y_cmd,
+        }
+
+    # ── Case 2: no ball, pedestal visible → lateral-only fallback ─────────────
+    if pedestal is not None:
+        lat_err = pedestal["lateral_err_px"]
+        lateral_ok = abs(lat_err) < PEDESTAL_LATERAL_TOL_PX
+
+        if lat_err > PEDESTAL_LATERAL_TOL_PX:
+            x_cmd = "LEFT"
+        elif lat_err < -PEDESTAL_LATERAL_TOL_PX:
+            x_cmd = "RIGHT"
+        else:
+            x_cmd = "STOP"
+
+        return {
+            "ball_found":    False,
+            "pedestal_mode": True,
+            "lateral_ok":    lateral_ok,
+            "distance_ok":   False,     # never OK without the ball
+            "aligned":       False,     # can't be fully aligned without ball
+            "lateral_err_px": lat_err,
+            "area":          0,
+            "distance_state": "PEDESTAL",
+            "x_cmd":         x_cmd,
+            "y_cmd":         "STOP",    # no forward/back in pedestal mode
+        }
+
+    # ── Case 3: nothing found ──────────────────────────────────────────────────
+    return {
+        "ball_found":    False,
+        "pedestal_mode": False,
+        "lateral_ok":    False,
+        "distance_ok":   False,
+        "aligned":       False,
+        "lateral_err_px": None,
+        "area":          0,
+        "distance_state": "LOST",
+        "x_cmd":         "STOP",
+        "y_cmd":         "STOP",
     }
 
 
@@ -368,6 +477,11 @@ class BallAlignState:
     def ball_found(self) -> bool:
         return self.get().get("ball_found", False)
 
+    @property
+    def pedestal_mode(self) -> bool:
+        """True when aligning to the blue pedestal as a fallback (no ball yet)."""
+        return self.get().get("pedestal_mode", False)
+
     def stop(self):
         self._running = False
         try: self._sock.close()
@@ -426,12 +540,14 @@ def do_ball_align(mc, align_state: BallAlignState,
             continue
 
         if verbose:
-            bf  = st.get("ball_found", False)
-            lat = st.get("lateral_err_px")
-            dst = st.get("distance_state", "?")
-            area = st.get("area", 0)
-            dist_err = max(0, AREA_CLOSE_THRESHOLD - area)
-            print(f"  ball={'FOUND' if bf else 'LOST'}  "
+            bf        = st.get("ball_found", False)
+            ped_mode  = st.get("pedestal_mode", False)
+            lat       = st.get("lateral_err_px")
+            dst       = st.get("distance_state", "?")
+            area      = st.get("area", 0)
+            dist_err  = max(0, AREA_CLOSE_THRESHOLD - area)
+            source    = "BALL" if bf else ("PEDESTAL" if ped_mode else "LOST")
+            print(f"  [{source}]  "
                   f"lat={'---' if lat is None else f'{lat:+.0f}px'}  "
                   f"dist={dst}  area={area}  "
                   f"x={st.get('x_cmd','?')}  y={st.get('y_cmd','?')}  "
@@ -442,23 +558,29 @@ def do_ball_align(mc, align_state: BallAlignState,
             if verbose: print("[ball_align] Aligned!")
             return True
 
-        if not st.get("ball_found"):
-            # No ball visible — stop and wait
+        x_cmd    = st.get("x_cmd", "STOP")
+        y_cmd    = st.get("y_cmd", "STOP")
+        ped_mode = st.get("pedestal_mode", False)
+        lat      = st.get("lateral_err_px") or 0
+        area     = st.get("area", 0)
+        dist_err = max(0, AREA_CLOSE_THRESHOLD - area)
+
+        if not st.get("ball_found") and not ped_mode:
+            # Completely lost — stop and wait
             mc.brake()
             time.sleep(0.05)
             continue
 
-        # ── Send movement command ──────────────────────────────────────────
-        x_cmd = st.get("x_cmd", "STOP")
-        y_cmd = st.get("y_cmd", "STOP")
+        # ── Lateral strafe ─────────────────────────────────────────────────────
+        # Use gentler power when only the pedestal is visible (coarser target).
+        strafe_base = ALIGN_PEDESTAL_STRAFE_POWER if ped_mode else ALIGN_STRAFE_POWER
+        vX = {
+            "RIGHT":  strafe_base * abs(lat) / 300,
+            "LEFT":  -strafe_base * abs(lat) / 300,
+        }.get(x_cmd, 0)
 
-        # Map x_cmd / y_cmd to OmniMovement
-        # Back camera: ball right of centre = need to strafe RIGHT
-        # y_cmd BACK = move robot backward (toward ball = BACK in robot frame
-        # since robot faces 270° = away from ball)
-        # do lat err scaling
-        vX = {"RIGHT": ALIGN_STRAFE_POWER * abs(lat) / 300, "LEFT": -ALIGN_STRAFE_POWER * abs(lat) / 300}.get(x_cmd, 0)
-        # vY = {"BACK": -ALIGN_BACK_POWER}.get(y_cmd, 0)   # negative = back
+        # ── Back movement ──────────────────────────────────────────────────────
+        # Never commanded in pedestal mode (y_cmd is always "STOP" there).
         if y_cmd == "BACK":
             scale = min((dist_err / AREA_CLOSE_THRESHOLD), 1.0)
             vY = -ALIGN_BACK_POWER * scale
@@ -523,19 +645,24 @@ def main():
 
         frame_count += 1
         detection = detect_ball(frame)
-        state     = compute_align_state(detection)
+        # Pedestal fallback: only run if no white ball found (saves CPU)
+        pedestal  = detect_pedestal(frame) if detection is None else None
+        state     = compute_align_state(detection, pedestal)
         broadcaster.send(state)
 
         # ── Console output every 10 frames ───────────────────────────────────
         if frame_count % 10 == 0:
             if state["ball_found"]:
-                print(f"  lat={state['lateral_err_px']:+4.0f}px  "
+                print(f"  [BALL]     lat={state['lateral_err_px']:+4.0f}px  "
                       f"area={state['area']:7d}  "
                       f"dist={state['distance_state']:5}  "
                       f"x={state['x_cmd']:5}  y={state['y_cmd']:4}  "
                       f"{'✓ ALIGNED' if state['aligned'] else ''}")
+            elif state["pedestal_mode"]:
+                print(f"  [PEDESTAL] lat={state['lateral_err_px']:+4.0f}px  "
+                      f"x={state['x_cmd']:5}  (waiting for white ball)")
             else:
-                print("  No ball detected")
+                print("  [LOST]     nothing detected")
 
         # ── Debug display ─────────────────────────────────────────────────────
         if show_debug:
@@ -566,12 +693,12 @@ def main():
                 cv2.line(display, (cx_frame, cy), (cx, cy), (0, 200, 255), 2)
 
                 # Stats overlay
-                lat = state["lateral_err_px"]
+                lat  = state["lateral_err_px"]
                 area = state["area"]
                 dst  = state["distance_state"]
                 xcmd = state["x_cmd"]
                 ycmd = state["y_cmd"]
-                txt = (f"lat={lat:+.0f}px  {xcmd} | "
+                txt = (f"BALL  lat={lat:+.0f}px  {xcmd} | "
                        f"area={area//1000}k  dist={dst}  {ycmd}")
                 cv2.putText(display, txt, (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
@@ -580,8 +707,27 @@ def main():
                     cv2.putText(display, "ALIGNED", (cx_frame - 60, actual_h - 20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
 
+            elif pedestal is not None:
+                # Pedestal fallback mode — draw pedestal in blue/orange
+                bx, by, bw, bh = pedestal["bbox"]
+                ped_color = (255, 160, 0) if state["lateral_ok"] else (0, 120, 255)
+                cv2.rectangle(display, (bx, by), (bx+bw, by+bh), ped_color, 2)
+
+                cx, cy = pedestal["centroid_x"], pedestal["centroid_y"]
+                cv2.circle(display, (cx, cy), 8, ped_color, -1)
+                cv2.circle(display, (cx, cy), 8, (255, 255, 255), 1)
+
+                # Lateral error line from frame centre to pedestal centroid
+                cv2.line(display, (cx_frame, cy), (cx, cy), (255, 200, 50), 2)
+
+                lat  = state["lateral_err_px"]
+                xcmd = state["x_cmd"]
+                txt = f"PEDESTAL (no ball)  lat={lat:+.0f}px  {xcmd}  | waiting for white ball"
+                cv2.putText(display, txt, (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, ped_color, 2)
+
             else:
-                cv2.putText(display, "NO BALL", (10, 30),
+                cv2.putText(display, "LOST — no ball or pedestal", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
             # Show masks side by side at reduced size
@@ -593,6 +739,12 @@ def main():
                 side_small = cv2.resize(side, (int(side.shape[1]*scale),
                                                 int(side.shape[0]*scale)))
                 display[:side_small.shape[0], :side_small.shape[1]] = side_small
+            elif pedestal is not None:
+                bm = cv2.cvtColor(pedestal["blue_mask"], cv2.COLOR_GRAY2BGR)
+                scale = 0.3
+                bm_small = cv2.resize(bm, (int(bm.shape[1]*scale),
+                                           int(bm.shape[0]*scale)))
+                display[:bm_small.shape[0], :bm_small.shape[1]] = bm_small
 
             if HAS_DISPLAY:
                 win_w = int(960 * DISPLAY_SCALE)
