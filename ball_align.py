@@ -531,7 +531,9 @@ def do_ball_align(mc, align_state: BallAlignState,
     if verbose:
         print("[ball_align] Starting alignment...")
 
+    stable = 0
     t0 = time.time()
+    loss_time = None
     while time.time() - t0 < timeout:
         st = align_state.get()
 
@@ -554,9 +556,20 @@ def do_ball_align(mc, align_state: BallAlignState,
                   f"{'✓ ALIGNED' if st.get('aligned') else ''}")
 
         if st.get("aligned"):
-            mc.brake()
-            if verbose: print("[ball_align] Aligned!")
-            return True
+            if loss_time and time.time() - loss_time < 1.0:
+                print("[ball_align] Alignment After Loss Rejected!")
+                stable = 0
+            elif time.time() - t0 < 0.75:
+                print("[ball_align] Alignment After Start Rejected!")
+                stable = 0
+            else:
+                stable += 1
+                if stable >= 5:
+                    mc.brake()
+                    if verbose: print("[ball_align] Aligned!")
+                    return True
+        else:
+            stable = 0
 
         x_cmd    = st.get("x_cmd", "STOP")
         y_cmd    = st.get("y_cmd", "STOP")
@@ -567,6 +580,7 @@ def do_ball_align(mc, align_state: BallAlignState,
 
         if not st.get("ball_found") and not ped_mode:
             # Completely lost — stop and wait
+            loss_time = time.time()
             mc.brake()
             time.sleep(0.05)
             continue
@@ -593,7 +607,6 @@ def do_ball_align(mc, align_state: BallAlignState,
     mc.brake()
     if verbose: print("[ball_align] TIMEOUT — alignment failed.")
     return False
-
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # MAIN — standalone camera loop with live debug display

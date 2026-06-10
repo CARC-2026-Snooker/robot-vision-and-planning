@@ -12,7 +12,7 @@ def main():
     
     # The physical size of a single square on your printed board in meters
     # e.g., 25mm = 0.025 meters
-    SQUARE_SIZE_METERS = 0.020
+    SQUARE_SIZE_METERS = 0.028
 
     # Criteria for refining the corner detection (sub-pixel accuracy)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
