@@ -69,6 +69,26 @@ BALL_HSV = {
 }
 DIST_COEFFS = CAM_4K_DIST_COEFFS
 
+# ── CUT target-line smoothing ─────────────────────────────────────────────────
+# The TARGET line position is exponentially smoothed over time so that a tag
+# flickering in/out of frame doesn't make the line jump.
+#
+# Two alpha values — one per detection quality:
+#   CUT_TARGET_ALPHA_RATIO : both tags visible  → higher alpha (trust fast, accurate)
+#   CUT_TARGET_ALPHA_DEPTH : only one tag        → lower alpha  (trust slow, less accurate)
+#
+# alpha = 1.0 → no smoothing (instant snap to raw value)
+# alpha = 0.05 → very heavy smoothing (~20 frames to reach 63% of a step change)
+# At ~1fps camera: 0.25 ≈ 4-frame (4s) time constant for ratio mode
+#                  0.10 ≈ 10-frame (10s) time constant for depth fallback mode
+#
+# CUT_TARGET_STALE_S: if NO tags are visible for this many seconds, the smoothed
+# value is discarded and target_col returns None (LOST). Prevents using a very
+# old stale estimate indefinitely.
+CUT_TARGET_ALPHA_RATIO = 0.25   # both tags detected: follow fairly quickly
+CUT_TARGET_ALPHA_DEPTH = 0.10   # single-tag fallback: follow slowly (noisier)
+CUT_TARGET_STALE_S     = 5.0    # discard smoothed value if no tags seen for this long
+
 # ── Load position calibration (same file as new_main3.py) ────────────────────
 # calibration.json is one level up (Carc2026/ root). If absent, identity used.
 _CAL_FILE = os.path.join(os.path.dirname(__file__), "..", "calibration.json")
@@ -156,15 +176,29 @@ def draw_map_line(canvas, x1, y1, x2, y2, color=(255, 255, 255), thickness=2):
 class Sniper4kThread(threading.Thread):
     def __init__(self, target_tag_id, ball_color="Red",
                  corner_offset_px=0.0, corner_offset_mm=0.0,
-                 cut_offset_sign=0.0, cut_sin=0.0):
+                 # CUT three-line alignment — firing-line wall-intercept target
+                 cut_tag_a_id=None,    # first  Y=0 tag bracketing the intercept
+                 cut_tag_b_id=None,    # second Y=0 tag (or None → single-tag fallback)
+                 cut_ratio=0.0,        # interpolation weight: 0=tag_a, 1=tag_b
+                 cut_off_a_mm=0.0,     # signed mm offset from tag_a (single-tag fallback)
+                 cut_off_b_mm=0.0,     # signed mm offset from tag_b (single-tag fallback)
+                 # CUT ball aiming offset — shifts the BALL LINE from centroid
+                 # to the ghost-ball contact point on the ball surface
+                 cut_offset_sign=0.0,  # +1 or -1: which side of ball to aim at
+                 cut_sin=0.0):         # sin(cut_angle_deg): how far from centre
         super().__init__(daemon=True)
-        self.target_tag_id         = target_tag_id
-        self.ball_color            = ball_color
-        self.corner_offset_px      = corner_offset_px   # startup pixel estimate (fallback)
-        self.corner_offset_mm      = corner_offset_mm   # physical mm — used for live scaling
-        self.cut_offset_sign       = cut_offset_sign
-        self.cut_sin               = cut_sin
-        self.tag_size              = 0.11
+        self.target_tag_id    = target_tag_id
+        self.ball_color       = ball_color
+        self.corner_offset_px = corner_offset_px
+        self.corner_offset_mm = corner_offset_mm
+        self.cut_tag_a_id     = cut_tag_a_id
+        self.cut_tag_b_id     = cut_tag_b_id
+        self.cut_ratio        = cut_ratio
+        self.cut_off_a_mm     = cut_off_a_mm
+        self.cut_off_b_mm     = cut_off_b_mm
+        self.cut_offset_sign  = cut_offset_sign
+        self.cut_sin          = cut_sin
+        self.tag_size         = 0.11
 
         # Shared results (written by thread, read by main loop)
         self._lock          = threading.Lock()
@@ -182,6 +216,9 @@ class Sniper4kThread(threading.Thread):
         self._ball_col      = None    # pixel column of ball centroid (full-res)
         self._target_col    = None    # pixel column of tag + live corner offset (full-res)
         self._cam_cx        = None    # camera centre column (full-res, for main())
+        # CUT target-line smoothing state (EMA — persists between frames)
+        self._tgt_smooth    = None    # float: current smoothed target column
+        self._tgt_last_seen = 0.0     # timestamp of last frame with ≥1 visible tag
 
         self.running  = True
         self.detector = Detector(families="tag36h11")
@@ -268,6 +305,9 @@ class Sniper4kThread(threading.Thread):
             tag_cy     = None
             tag_tz_live = 0.0   # live optical-axis depth of target tag (metres)
             draw_frame = frame_ud.copy()
+            # Pixel columns of every detected known tag — keyed by tag_id
+            # value: (col_px: int, tz_metres: float)
+            all_tag_cols: dict = {}
 
             # Accumulate heading contributions from all detected tags
             sin_sum = 0.0
@@ -295,6 +335,14 @@ class Sniper4kThread(threading.Thread):
                 cos_sum += w_tag * math.cos(heading_rad)
                 heading_total_w += w_tag
                 heading_n += 1
+
+                # Record pixel column + live depth for ALL known tags
+                # (CUT mode needs two Y=0 tags for the interpolation)
+                if tag.tag_id in KNOWN_TAGS:
+                    all_tag_cols[tag.tag_id] = (
+                        int(tag.center[0]),
+                        float(tag.pose_t[2][0])   # optical-axis depth in metres
+                    )
 
                 # ── Visual overlays for the TARGET tag only ────────────────
                 if tag.tag_id != self.target_tag_id:
@@ -366,35 +414,185 @@ class Sniper4kThread(threading.Thread):
             ball_col   = None
             target_col = None
 
-            if self.cut_sin > 0.0 or self.cut_offset_sign != 0.0:
-                # ── CUT MODE overlay ─────────────────────────────────────
+            if self.cut_tag_a_id is not None:
+                # ── CUT MODE — three-line firing-line alignment ───────────
+                #
+                # Same three-line system as STRAIGHT:
+                #   GREEN  (AIM)    = camera centre = robot shooting axis
+                #   YELLOW (BALL)   = ball centroid column
+                #   MAGENTA(TARGET) = pixel column of the Y=0 wall point where
+                #                     the firing line meets it, computed by
+                #                     interpolating between two detected tag cols
+                #
+                # TARGET column resolution order:
+                #   1. Both tag_a AND tag_b visible:
+                #        target_col = col_a + ratio × (col_b − col_a)
+                #        Pure pixel ratio — no depth needed — most accurate.
+                #   2. Only tag_a:
+                #        target_col = col_a + fx × off_a_mm / (tz_a × 1000)
+                #   3. Only tag_b:
+                #        target_col = col_b + fx × off_b_mm / (tz_b × 1000)
+                #   4. Neither: target_col = None (LOST)
+                #
+                # Error signals (identical to STRAIGHT):
+                #   diff_error = ball_col − target_col  → vX (strafe)
+                #   mid_error  = mid(ball,target) − cam_cx  → vR (rotate)
+
+                fx_now  = self.camera_params_4k[0]
+                entry_a = all_tag_cols.get(self.cut_tag_a_id)   # (col, tz) or None
+                entry_b = all_tag_cols.get(self.cut_tag_b_id)   # (col, tz) or None
+
+                # ── Raw target column estimate ─────────────────────────────
+                # Priority: ratio (both tags) > depth from a > depth from b > None
+                # Each method gets a different EMA alpha — ratio is more accurate
+                # so it's allowed to pull the smoothed value faster.
+                both_visible = entry_a is not None and entry_b is not None
+                if both_visible:
+                    raw_tgt = (entry_a[0]
+                               + self.cut_ratio * (entry_b[0] - entry_a[0]))
+                    alpha   = CUT_TARGET_ALPHA_RATIO
+                    tag_src = (f"T{self.cut_tag_a_id}({entry_a[0]}px)"
+                               f"+{self.cut_ratio*100:.0f}%→"
+                               f"T{self.cut_tag_b_id}({entry_b[0]}px)")
+                elif entry_a is not None and entry_a[1] > 0.01:
+                    off_px  = fx_now * self.cut_off_a_mm / (entry_a[1] * 1000.0)
+                    raw_tgt = entry_a[0] + off_px
+                    alpha   = CUT_TARGET_ALPHA_DEPTH
+                    tag_src = f"T{self.cut_tag_a_id}+depth({off_px:+.0f}px)"
+                elif entry_b is not None and entry_b[1] > 0.01:
+                    off_px  = fx_now * self.cut_off_b_mm / (entry_b[1] * 1000.0)
+                    raw_tgt = entry_b[0] + off_px
+                    alpha   = CUT_TARGET_ALPHA_DEPTH
+                    tag_src = f"T{self.cut_tag_b_id}+depth({off_px:+.0f}px)"
+                else:
+                    raw_tgt = None
+                    alpha   = 0.0
+                    tag_src = "NO TAGS"
+
+                # ── EMA smoothing ──────────────────────────────────────────
+                # Update last-seen timestamp whenever any raw estimate exists.
+                # When tags flicker out: hold the last smoothed value instead
+                # of jumping to None.  When they reappear: blend back gently.
+                # Ratio-method alpha is higher (faster) than depth-method alpha
+                # (lower/slower) so that a less-reliable single-tag reading
+                # barely nudges the estimate, while both-tag ratio readings
+                # can pull it more decisively.
+                now_t = time.time()
+                if raw_tgt is not None:
+                    self._tgt_last_seen = now_t
+                    if self._tgt_smooth is None:
+                        self._tgt_smooth = float(raw_tgt)  # cold start: seed directly
+                    else:
+                        self._tgt_smooth = (alpha * raw_tgt
+                                            + (1.0 - alpha) * self._tgt_smooth)
+                else:
+                    # No tags this frame — keep holding last smoothed value
+                    # but discard it if it has been too long (stale)
+                    if (self._tgt_smooth is not None
+                            and now_t - self._tgt_last_seen > CUT_TARGET_STALE_S):
+                        self._tgt_smooth = None
+
+                # Display: show raw vs smoothed so the operator can see the gap
+                if self._tgt_smooth is not None and raw_tgt is not None:
+                    tag_src += (f"  α={alpha:.2f} "
+                                f"raw={raw_tgt:.0f} smth={self._tgt_smooth:.0f}")
+                elif self._tgt_smooth is not None:
+                    age = now_t - self._tgt_last_seen
+                    tag_src = f"HOLDING  smth={self._tgt_smooth:.0f}  ({age:.1f}s ago)"
+
+                tgt_col    = (int(round(self._tgt_smooth))
+                              if self._tgt_smooth is not None else None)
+                target_col = tgt_col
+
+                # Green: robot shooting axis
                 cv2.line(draw_frame, (cam_centre_x, 0), (cam_centre_x, self._actual_h),
                          (0, 255, 0), 3)
                 cv2.putText(draw_frame, "AIM",
-                            (cam_centre_x + 8, self._actual_h // 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 4)
+                            (cam_centre_x + 8, self._actual_h // 7),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 255, 0), 3)
 
-                if ball_centroid is not None and ball_width_px is not None:
-                    ball_radius_px = ball_width_px / 2.0
-                    offset_px  = self.cut_offset_sign * self.cut_sin * ball_radius_px
-                    aiming_col = int(round(bx + offset_px))
+                # Cyan/light-blue: show both bracket tags with their column
+                for tid, clr in [(self.cut_tag_a_id, (0, 200, 255)),
+                                 (self.cut_tag_b_id, (100, 200, 255))]:
+                    if tid in all_tag_cols:
+                        tc = all_tag_cols[tid][0]
+                        cv2.line(draw_frame, (tc, 0), (tc, self._actual_h), clr, 2)
+                        cv2.putText(draw_frame, f"T{tid}",
+                                    (tc + 8, self._actual_h * 2 // 7),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, clr, 2)
 
-                    cv2.line(draw_frame, (aiming_col, 0), (aiming_col, self._actual_h),
-                             (0, 220, 255), 5)
+                # Magenta: target column (firing-line wall intercept)
+                if tgt_col is not None:
+                    # Thick magenta: smoothed target (what the servo uses)
+                    cv2.line(draw_frame, (tgt_col, 0), (tgt_col, self._actual_h),
+                             (255, 0, 255), 4)
                     cv2.putText(draw_frame, "TARGET",
-                                (aiming_col + 8, self._actual_h * 2 // 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 220, 255), 4)
-                    cv2.circle(draw_frame, (aiming_col, by), 18, (0, 220, 255), 4)
+                                (tgt_col + 10, self._actual_h * 3 // 7),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.3, (255, 0, 255), 4)
 
-                    half = int(ball_radius_px)
-                    bar_y = by + 35
-                    cv2.line(draw_frame, (bx - half, bar_y), (bx + half, bar_y), (200, 200, 0), 3)
+                    # Thin dashed pink: raw (un-smoothed) target — shows drift visually
+                    if raw_tgt is not None:
+                        raw_col = int(round(raw_tgt))
+                        if abs(raw_col - tgt_col) > 1:  # only draw if visibly different
+                            for y in range(0, self._actual_h, 24):
+                                cv2.line(draw_frame,
+                                         (raw_col, y),
+                                         (raw_col, min(y + 12, self._actual_h)),
+                                         (200, 100, 200), 2)
+
+                    cv2.putText(draw_frame, tag_src,
+                                (tgt_col + 10, self._actual_h * 4 // 7),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 100, 255), 2)
+
+                # Yellow: AIMING COLUMN — the ghost-ball contact point on the ball
+                # surface, offset from the ball centroid by sin(cut_angle) × radius.
+                # This is NOT the ball centre — it's the side of the ball that the
+                # robot's firing axis must pass through to execute the cut correctly.
+                #   aiming_col = ball_cx + cut_offset_sign × sin(cut_angle) × ball_radius_px
+                if ball_centroid is not None:
+                    if ball_width_px is not None and self.cut_sin > 0.0:
+                        ball_radius_px = ball_width_px / 2.0
+                        aiming_col = int(round(
+                            bx + self.cut_offset_sign * self.cut_sin * ball_radius_px
+                        ))
+                    else:
+                        aiming_col = bx   # fallback: treat as straight if no width
+
+                    ball_col = aiming_col   # this is what diff_error/mid_error use
+
+                    # Draw a faint centroid marker so the ball centre is still visible
+                    cv2.circle(draw_frame, (bx, by), 8, (0, 180, 80), 2)
+
+                    # Yellow: aiming column (the actual target point on ball surface)
+                    cv2.line(draw_frame, (aiming_col, 0), (aiming_col, self._actual_h),
+                             (0, 220, 100), 4)
+                    cv2.putText(draw_frame, "BALL",
+                                (aiming_col + 10, self._actual_h * 5 // 7),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 220, 100), 3)
+
+                    # Small circle on the ball at the exact contact point
+                    cv2.circle(draw_frame, (aiming_col, by), 14, (0, 220, 100), 3)
+
+                    # Width bar showing measured diameter + offset amount
+                    half = int(ball_width_px / 2) if ball_width_px else 20
+                    bar_y = by + 40
+                    cv2.line(draw_frame, (bx - half, bar_y), (bx + half, bar_y),
+                             (150, 150, 0), 2)
+                    off_px = aiming_col - bx
                     cv2.putText(draw_frame,
-                                f"{ball_width_px}px  r={ball_radius_px:.0f}",
+                                f"w={ball_width_px}px off={off_px:+d}px ({self.cut_sin*100:.0f}%r)",
                                 (bx - half, bar_y - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 0), 2)
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (150, 150, 0), 2)
 
-                    lateral_px = aiming_col - cam_centre_x
+                    if tgt_col is not None:
+                        mid_y   = self._actual_h * 3 // 4
+                        mid_col = (aiming_col + tgt_col) // 2
+                        cv2.line(draw_frame, (aiming_col, mid_y), (tgt_col, mid_y),
+                                 (200, 200, 0), 3)
+                        cv2.circle(draw_frame, (mid_col, mid_y), 8, (200, 200, 0), -1)
+                        cv2.putText(draw_frame, "MID",
+                                    (mid_col + 10, mid_y - 5),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 0), 2)
 
             else:
                 # ── STRAIGHT MODE — three-line alignment ─────────────────
@@ -566,42 +764,104 @@ def main():
     tag_depth_mm   = ry - tag_world_y_mm     # ry - tag_y_mm
     rx_m = rx / 1000.0                       # metres, for HD X-error display
 
-    # ── CUT offset parameters ─────────────────────────────────────────────────
-    # For CUT mode, the lateral signal is entirely ball-based (no tag needed):
-    #   aiming_col = ball_centroid_x + cut_offset_sign × sin(cut_angle) × ball_radius_px
-    #   lateral_error = aiming_col - cam_centre_x
-    # cut_offset_sign encodes WHICH SIDE of the ball to aim at.
-    # We derive it from the ghost_ball position relative to the ball, projected
-    # onto the camera's lateral (right) axis at the plan firing heading.
+    # ── CUT mode: compute firing-line Y=0 wall intercept ─────────────────────
+    # For CUT mode, the TARGET line is where the robot's firing axis would hit
+    # the Y=0 pocket wall.  We express this as an interpolation between two
+    # detected Y=0 AprilTag pixel columns so:
+    #   • No heading sensor is required
+    #   • Small tag-placement errors cancel (both tags shift together with robot movement)
+    #   • The offset scales automatically with robot distance (ratio is distance-independent)
     #
-    # Ghost ball is always one ball-diameter away from the ball in the direction
-    # OPPOSITE to the pocket — this is the surface contact point we aim at.
+    # Firing line: (rx, ry) + t·(cos(fire_angle), sin(fire_angle))
+    # At Y=0:  t = −ry / sin(fire_angle)
+    #          target_x_mm = rx + t·cos(fire_angle)
+    #
+    # Y=0 tags sorted by world X (from config):  tag3→X=0, tag4→X=600, tag5→X=1200
+    # Find bracket pair [tag_a, tag_b] that straddles target_x_mm.
+    # ratio = (target_x − tag_a_x) / (tag_b_x − tag_a_x)
+    # At runtime: target_col = col_a + ratio × (col_b − col_a)
+
+    Y0_TAGS = sorted(
+        [(int(round(info["x"] * 1000)), tid)
+         for tid, info in KNOWN_TAGS.items()
+         if abs(info["y"]) < 0.01],
+        key=lambda t: t[0]
+    )   # [(x_mm, tag_id), ...] sorted ascending
+
+    cut_tag_a_id = None
+    cut_tag_b_id = None
+    cut_ratio    = 0.0
+    cut_off_a_mm = 0.0
+    cut_off_b_mm = 0.0
+
+    if SHOT_MODE == "CUT" and abs(math.sin(math.radians(fire_angle_deg))) > 1e-6:
+        fire_rad_cut   = math.radians(fire_angle_deg)
+        t_wall         = -ry / math.sin(fire_rad_cut)
+        target_x_mm    = rx + t_wall * math.cos(fire_rad_cut)
+        print(f"[Sniper] CUT firing-line → Y=0 wall at X = {target_x_mm:.1f}mm")
+
+        # Find the bracket pair
+        bracketed = False
+        for i in range(len(Y0_TAGS) - 1):
+            xa, ta = Y0_TAGS[i]
+            xb, tb = Y0_TAGS[i + 1]
+            if xa <= target_x_mm <= xb:
+                cut_tag_a_id = ta
+                cut_tag_b_id = tb
+                cut_ratio    = (target_x_mm - xa) / (xb - xa)
+                cut_off_a_mm = target_x_mm - xa   # + = right of tag_a
+                cut_off_b_mm = target_x_mm - xb   # − = left  of tag_b
+                bracketed    = True
+                break
+
+        if not bracketed:
+            # Extrapolate from nearest boundary pair
+            if target_x_mm < Y0_TAGS[0][0]:
+                xa, ta = Y0_TAGS[0]; xb, tb = Y0_TAGS[1]
+            else:
+                xa, ta = Y0_TAGS[-2]; xb, tb = Y0_TAGS[-1]
+            cut_tag_a_id = ta; cut_tag_b_id = tb
+            cut_ratio    = (target_x_mm - xa) / (xb - xa)
+            cut_off_a_mm = target_x_mm - xa
+            cut_off_b_mm = target_x_mm - xb
+
+        print(f"[Sniper] CUT tag pair: tag{cut_tag_a_id}↔tag{cut_tag_b_id}  "
+              f"ratio={cut_ratio:.4f}  "
+              f"off_a={cut_off_a_mm:+.1f}mm  off_b={cut_off_b_mm:+.1f}mm")
+
+    # ── CUT ball-offset: which side of the ball to aim at ────────────────────
+    # The BALL LINE in CUT mode is NOT the ball centroid — it's the ghost-ball
+    # contact point, offset from the centroid by sin(cut_angle) × ball_radius.
+    # Direction (which side) is derived from the ghost_ball position projected
+    # onto the camera's lateral axis at the planned firing direction.
     cut_offset_sign = 0.0
     cut_sin         = 0.0
     if SHOT_MODE == "CUT":
-        fire_rad   = math.radians(fire_angle_deg)
-        cos_f      = math.cos(fire_rad)
-        sin_f      = math.sin(fire_rad)
-        right_x    = -sin_f
-        right_y    =  cos_f
-        ghost_x    = float(target_data["ghost_ball_xy"][0])
-        ghost_y    = float(target_data["ghost_ball_xy"][1])
-        ball_x_mm  = float(ball_xy[0])
-        ball_y_mm  = float(ball_xy[1])
-        # Camera-lateral component of the ghost-ball offset from ball centre
-        goff_x     = ghost_x - ball_x_mm
-        goff_y     = ghost_y - ball_y_mm
-        cam_lat_of_ghost = goff_x * right_x + goff_y * right_y   # mm
-        cut_offset_sign  = 1.0 if cam_lat_of_ghost >= 0.0 else -1.0
-        cut_sin          = math.sin(math.radians(cut_angle_deg))
-        print(f"[Sniper] CUT offset: sign={cut_offset_sign:+.0f}  "
+        fire_rad = math.radians(fire_angle_deg)
+        right_x  = -math.sin(fire_rad)   # camera right vector X component
+        right_y  =  math.cos(fire_rad)   # camera right vector Y component
+        ghost_x  = float(target_data["ghost_ball_xy"][0])
+        ghost_y  = float(target_data["ghost_ball_xy"][1])
+        ball_x_mm = float(ball_xy[0])
+        ball_y_mm = float(ball_xy[1])
+        goff_x   = ghost_x - ball_x_mm
+        goff_y   = ghost_y - ball_y_mm
+        cam_lat  = goff_x * right_x + goff_y * right_y   # mm, + = right in camera
+        cut_offset_sign = 1.0 if cam_lat >= 0.0 else -1.0
+        cut_sin         = math.sin(math.radians(cut_angle_deg))
+        print(f"[Sniper] CUT ball offset: sign={cut_offset_sign:+.0f}  "
               f"sin({cut_angle_deg:.1f}°)={cut_sin:.4f}  "
-              f"(ghost cam-lateral: {cam_lat_of_ghost:+.1f}mm)")
+              f"(ghost cam-lateral={cam_lat:+.1f}mm)")
 
     # ── Start 4K thread ─────────────────────────────────────────────────────
     sniper_thread = Sniper4kThread(
         target_tag_id, ball_color,
         corner_offset_px=0.0,
+        cut_tag_a_id=cut_tag_a_id,
+        cut_tag_b_id=cut_tag_b_id,
+        cut_ratio=cut_ratio,
+        cut_off_a_mm=cut_off_a_mm,
+        cut_off_b_mm=cut_off_b_mm,
         cut_offset_sign=cut_offset_sign,
         cut_sin=cut_sin,
     )
@@ -610,51 +870,34 @@ def main():
     # Compute lateral sensitivity now that thread has opened the camera
     fx_4k = sniper_thread.camera_params_4k[0]
 
-    if SHOT_MODE == "STRAIGHT":
-        # STRAIGHT: lateral_px = ball_cx - cam_cx  (ball vs camera firing line)
-        # When robot moves 1mm laterally, ball shifts by fx/ball_depth pixels.
-        # (The tag also shifts, but we no longer use tag for lateral — only heading.)
-        if ball_depth_mm > 0:
-            lateral_sens   = fx_4k / ball_depth_mm   # px per mm
-            lateral_acc_mm = LATERAL_TOL_PX / lateral_sens if lateral_sens > 1e-9 else 99.9
-        else:
-            lateral_sens   = 1.0
-            lateral_acc_mm = 99.9
-        print(f"[Sniper] Lateral sensitivity (STRAIGHT): {lateral_sens:.3f} px/mm  "
-              f"(ball_depth={ball_depth_mm:.0f}mm, tol={LATERAL_TOL_PX}px → ±{lateral_acc_mm:.1f}mm)")
+    # ── Lateral sensitivity — same formula for both STRAIGHT and CUT ─────────
+    # When the robot strafes 1mm, the ball shifts fx/ball_depth pixels in the frame.
+    # The target (tag or wall intercept) also shifts, but at its own depth.
+    # The net diff_error sensitivity per mm = fx/ball_depth − fx/target_depth.
+    # For simplicity we use fx/ball_depth as the mm-per-pixel scale —
+    # it's correct to within ~10% and the target depth terms are similar.
+    if ball_depth_mm > 0:
+        lateral_sens   = fx_4k / ball_depth_mm
+        lateral_acc_mm = LATERAL_TOL_PX / lateral_sens if lateral_sens > 1e-9 else 99.9
     else:
-        # CUT: signal is purely ball-based (cam_centre vs aiming_col).
-        # Sensitivity = how much aiming_col shifts per mm of robot lateral movement.
-        # When robot moves 1mm laterally, ball shifts by fx/ball_depth pixels in the image.
-        # (The aiming point offset_px scales with ball_width, which barely changes,
-        #  so the dominant term is just the ball shifting in the frame.)
-        if ball_depth_mm > 0:
-            lateral_sens   = fx_4k / ball_depth_mm   # px per mm
-            lateral_acc_mm = LATERAL_TOL_PX / lateral_sens if lateral_sens > 1e-9 else 99.9
-        else:
-            lateral_sens   = 1.0
-            lateral_acc_mm = 99.9
-        print(f"[Sniper] Lateral sensitivity (CUT): {lateral_sens:.3f} px/mm  "
-              f"(ball_depth={ball_depth_mm:.0f}mm, tol={LATERAL_TOL_PX}px → ±{lateral_acc_mm:.1f}mm)")
+        lateral_sens   = 1.0
+        lateral_acc_mm = 99.9
+    print(f"[Sniper] Lateral sensitivity: {lateral_sens:.3f} px/mm  "
+          f"(ball_depth={ball_depth_mm:.0f}mm  tol={LATERAL_TOL_PX}px → ±{lateral_acc_mm:.1f}mm)")
 
-    # ── target_lateral_px: used only for STRAIGHT mode ───────────────────────
-    # CUT mode has no fixed target — it recomputes each frame from ball width.
+    # ── STRAIGHT: corner offset on target tag ────────────────────────────────
     CORNER_TAGS_SIGN = {3: +1, 5: -1}   # Hole_3 = left corner (+X), Hole_5 = right (−X)
-
+    target_lateral_px = 0.0
     if SHOT_MODE == "STRAIGHT":
         if target_tag_id in CORNER_TAGS_SIGN and CORNER_OFFSET_MM != 0:
             corner_sign        = CORNER_TAGS_SIGN[target_tag_id]
             signed_offset_mm   = corner_sign * CORNER_OFFSET_MM
             target_lateral_px  = fx_4k * signed_offset_mm / tag_depth_mm
             sniper_thread.corner_offset_px = target_lateral_px
-            sniper_thread.corner_offset_mm = signed_offset_mm   # for live scaling
+            sniper_thread.corner_offset_mm = signed_offset_mm
             print(f"[Sniper] Corner offset: {signed_offset_mm:+.1f}mm  "
                   f"≈ {target_lateral_px:+.1f}px at startup depth  "
                   f"({'RIGHT' if corner_sign>0 else 'LEFT'} of tag center)")
-        else:
-            target_lateral_px = 0.0
-    else:
-        target_lateral_px = 0.0   # not used for CUT
 
     # ── HD camera (position — 30fps) ─────────────────────────────────────────
     if sys.platform.startswith('win'):
@@ -917,65 +1160,49 @@ def main():
             x_error = 0.0
             y_error = 0.0
 
-        if SHOT_MODE == "STRAIGHT":
-            # ── Three-line alignment — no heading sensor ──────────────────
-            # Two pixel-space signals drive two independent axes:
-            #
-            #   diff_error = ball_col - target_col  → vX (STRAFE)
-            #     > 0: ball right of target → MOVE RIGHT
-            #     < 0: ball left of target  → MOVE LEFT
-            #
-            #   mid_error = midpoint(ball,target) - cam_cx  → vR (ROTATE)
-            #     > 0: midpoint right of centre → TURN RIGHT (shifts both left)
-            #     < 0: midpoint left of centre  → TURN LEFT
-            #
-            # Both zero ↔ ball_col = target_col = cam_cx = perfect alignment.
+        # ── Three-line error signals (both STRAIGHT and CUT) ─────────────────
+        # STRAIGHT: target_col = tag_cx + live_corner_offset  (from run() thread)
+        # CUT:      target_col = col_a + ratio*(col_b-col_a)  (from run() thread)
+        # In both cases the thread writes _ball_col and _target_col each frame.
+        #
+        #   diff_error = ball_col − target_col  → vX (strafe)
+        #     > 0: ball right of target → MOVE RIGHT
+        #     < 0: ball left of target  → MOVE LEFT
+        #
+        #   mid_error  = (ball_col + target_col)/2 − cam_cx  → vR (rotate)
+        #     > 0: midpoint right of cam centre → TURN RIGHT
+        #     < 0: midpoint left of cam centre  → TURN LEFT
+        #
+        # Both zero  ↔  ball_col = target_col = cam_cx  →  perfect alignment.
+        # No heading sensor needed for either mode.
 
-            if ball_col_4k is not None and target_col_4k is not None and cam_cx_4k is not None:
-                diff_error_px = float(ball_col_4k - target_col_4k)
-                mid_error_px  = float((ball_col_4k + target_col_4k) / 2.0 - cam_cx_4k)
+        if ball_col_4k is not None and target_col_4k is not None and cam_cx_4k is not None:
+            diff_error_px = float(ball_col_4k - target_col_4k)
+            mid_error_px  = float((ball_col_4k + target_col_4k) / 2.0 - cam_cx_4k)
 
-                # Convert diff to mm for mission_controller vX
-                if abs(lateral_sens) > 1e-9:
-                    lateral_mm = diff_error_px / lateral_sens
-                else:
-                    lateral_mm = 0.0
+            lateral_mm = diff_error_px / lateral_sens if abs(lateral_sens) > 1e-9 else 0.0
 
-                # Convert mid to degrees for mission_controller vR
-                # Rotation 1° shifts both columns by fx*sin(1°)/(depth/1000) pixels.
-                # Using tag depth as reference; keep sign: right of cam → positive.
-                if tag_depth_mm > 0:
-                    mid_deg = mid_error_px / (fx_4k * math.sin(math.radians(1.0)) / (tag_depth_mm / 1000.0))
-                else:
-                    mid_deg = mid_error_px / 100.0   # fallback gain
-
-                correction = mid_deg   # drives vR in mission_controller
-
-                lat_locked  = abs(diff_error_px)  < LATERAL_TOL_PX
-                ang_locked  = abs(mid_error_px)   < LATERAL_TOL_PX   # same px tolerance
-                pos_locked  = lat_locked and ang_locked
-
-                print(f"ball-target_err: {abs(diff_error_px)} mid-cam_error: {abs(mid_error_px)} lock_tolerance: {LATERAL_TOL_PX}")
-
+            # Convert mid_error (pixels) → degrees for mission_controller vR
+            # 1° of rotation shifts both columns by fx*sin(1°)/(depth_m) pixels
+            if tag_depth_mm > 0:
+                mid_deg = mid_error_px / (fx_4k * math.sin(math.radians(1.0))
+                                          / (tag_depth_mm / 1000.0))
             else:
-                diff_error_px = None
-                mid_error_px  = None
-                lateral_mm    = None
-                correction    = 0.0
-                lat_locked    = False
-                ang_locked    = False
-                pos_locked    = False
+                mid_deg = mid_error_px / 100.0
 
-        else:  # CUT
-            ang_locked = (blended_heading_deg is not None) and abs(correction) < ANGLE_LOCK_DEG
+            correction  = mid_deg   # drives vR in mission_controller
+            lat_locked  = abs(diff_error_px) < LATERAL_TOL_PX
+            ang_locked  = abs(mid_error_px)  < LATERAL_TOL_PX
+            pos_locked  = lat_locked and ang_locked
 
-            if lateral_px is not None:
-                lateral_mm = lateral_px / lateral_sens if abs(lateral_sens) > 1e-9 else None
-                lat_locked = abs(lateral_px) < LATERAL_TOL_PX
-            else:
-                lateral_mm = None
-                lat_locked = False
-            pos_locked = ang_locked and lat_locked
+        else:
+            diff_error_px = None
+            mid_error_px  = None
+            lateral_mm    = None
+            correction    = 0.0
+            lat_locked    = False
+            ang_locked    = False
+            pos_locked    = False
 
         # print(f"before broadcast initialized is : {initialized} | x_error={x_error:.1f} | y_error={y_error:.1f} | state={state_text}")
 
@@ -1113,61 +1340,53 @@ def main():
 
         else:
             # ────────────────────────────────────────────────────────────────
-            # CUT MODE HUD — same two-step display as STRAIGHT.
-            # Step 1: Angle (heading toward firing direction via AprilTag).
-            # Step 2: Lateral (ball aligned to ghost-ball offset target).
-            #
-            # The magenta TARGET LINE on the 4K view shows where the ball
-            # centre needs to be (offset from the tag guide by target_lateral_px).
-            # When the coloured ball centroid sits on the magenta line and the
-            # angle is green, the robot is aimed at the ghost-ball contact point.
+            # CUT MODE HUD — identical three-line layout to STRAIGHT.
+            # TARGET line = firing-line Y=0 wall intercept (interpolated tags).
             # ────────────────────────────────────────────────────────────────
 
-            cut_info = f"  ({cut_angle_deg:.0f}° cut  offset={cut_offset_sign*cut_sin*100:.0f}% radius)"
+            cut_label = (f"cut={cut_angle_deg:.0f}°  "
+                         f"T{cut_tag_a_id}↔T{cut_tag_b_id}  r={cut_ratio:.2f}"
+                         if cut_tag_a_id is not None else f"cut={cut_angle_deg:.0f}°")
 
-            # ── STEP 1: Heading ───────────────────────────────────────────────
-            hdg_info = (f"  (now {blended_heading_deg:.1f}° → {target_heading_deg:.1f}°  {source_str})"
-                        if blended_heading_deg is not None else "  (no heading)")
-            cv2.putText(hud, f"STEP 1 — HEADING{cut_info}",
-                        (30, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 180, 180), 2)
-            cv2.putText(hud, hdg_info,
-                        (30, 112), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (140, 140, 140), 1)
-            if blended_heading_deg is None:
-                cv2.putText(hud, "No heading estimate (no tags visible)",
-                            (30, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 0, 255), 3)
-            elif ang_locked:
-                cv2.putText(hud, f"HEADING OK  ({correction:+.2f}°)",
-                            (30, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 4)
+            # ── STEP 1: Rotate ────────────────────────────────────────────────
+            if ball_col_4k is None or target_col_4k is None:
+                cv2.putText(hud, f"STEP 1 — ROTATE  ({cut_label})  need ball+tags in view",
+                            (30, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (180, 180, 180), 2)
+                cv2.putText(hud, "Waiting for ball and tag...",
+                            (30, 130), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (100, 100, 100), 2)
             else:
-                d = "RIGHT" if correction > 0 else "LEFT"
-                cv2.putText(hud, f"TURN {d}:  {abs(correction):.2f}°",
-                            (30, 148), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 165, 255), 5)
+                mid_px = (ball_col_4k + target_col_4k) / 2.0 - cam_cx_4k
+                cv2.putText(hud, f"STEP 1 — ROTATE  ({cut_label})  mid={mid_px:+.0f}px",
+                            (30, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (180, 180, 180), 2)
+                if ang_locked:
+                    cv2.putText(hud, f"ROTATE OK  ({correction:+.2f}°  mid={mid_px:+.0f}px)",
+                                (30, 130), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 4)
+                else:
+                    d = "RIGHT" if correction > 0 else "LEFT"
+                    cv2.putText(hud, f"TURN {d}:  {abs(correction):.2f}°",
+                                (30, 130), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 165, 255), 5)
 
-            # Divider
             cv2.line(hud, (20, 148), (660, 148), (60, 60, 60), 1)
 
-            # ── STEP 2: Lateral ──────────────────────────────────────────────
-            cv2.putText(hud, "STEP 2 — AIM AT GHOST BALL  (after angle is set)",
+            # ── STEP 2: Strafe ────────────────────────────────────────────────
+            cv2.putText(hud, "STEP 2 — STRAFE  (close gap: ball line onto firing-line target)",
                         (30, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (180, 180, 180), 2)
             if lateral_mm is None:
-                no_ball_msg = "Ball not detected" if tag_found_4k else "Waiting for tag..."
-                cv2.putText(hud, no_ball_msg,
+                cv2.putText(hud, "Waiting for ball and tag...",
                             (30, 218), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (100, 100, 100), 2)
             elif lat_locked:
-                cv2.putText(hud, f"AIM OK  ({lateral_mm:+.1f} mm)",
+                cv2.putText(hud, f"STRAFE OK  ({lateral_mm:+.1f} mm)",
                             (30, 218), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 4)
             else:
                 d = "RIGHT" if lateral_mm > 0 else "LEFT"
                 cv2.putText(hud, f"MOVE {d}:  {abs(lateral_mm):.1f} mm",
                             (30, 218), cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 165, 255), 5)
 
-            # ── Lock banner ──────────────────────────────────────────────────
-            if pos_locked and ang_locked:
+            if pos_locked:
                 cv2.rectangle(hud, (0, 238), (1280, 310), (0, 70, 0), -1)
                 cv2.putText(hud, "LOCKED!  PRESS 'f' TO FIRE",
                             (30, 295), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 255, 0), 5)
 
-            # HD state — tiny info at bottom
             track_col = (0,200,0) if state_text=="STILL" else (0,140,200) if state_text=="TRANSITIONING" else (0,0,180)
             hd_txt = f"HD: {state_text}  X={x_error:+.0f}mm  Y={y_error:+.0f}mm" if initialized else f"HD: {state_text}"
             cv2.putText(hud, hd_txt, (15, disp_h - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, track_col, 1)
@@ -1272,7 +1491,7 @@ def main():
                               ry/1000.0 + cone_len*math.sin(a_min))
         pt2 = world_to_pixel(rx/1000.0 + cone_len*math.cos(a_max),
                               ry/1000.0 + cone_len*math.sin(a_max))
-        locked_both = pos_locked and ang_locked
+        locked_both = pos_locked
         cone_color = (0, 255, 0) if locked_both else mode_col_map
         overlay = map_canvas.copy()
         cv2.fillPoly(overlay, [np.array([tgt_pt, pt1, pt2], dtype=np.int32)], cone_color)
@@ -1343,7 +1562,7 @@ def main():
         else:
             key = -1
 
-        if key == ord('f') and pos_locked and ang_locked:
+        if key == ord('f') and pos_locked:
             print(f"[{SHOT_MODE}] FIRE!  Angle={correction:.2f}°  "
                   f"X={last_x*1000:.1f}mm  Y={last_y*1000:.1f}mm")
             break
