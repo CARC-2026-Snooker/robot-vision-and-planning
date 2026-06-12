@@ -51,22 +51,49 @@ from config import (
 
 HAS_DISPLAY = bool(os.environ.get("DISPLAY"))
 
+DISPLAY_SCALE = 1.0
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TUNABLE PARAMETERS
 # All values calibrated for the camera view shown in the reference images.
 # Tune on the actual robot by running standalone: uv run ball_align.py
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# AT UNI
+
+# HSV_BALL_LO = np.array([0, 0, 43])
+# HSV_BALL_HI = np.array([179, 83, 255])
+
+# # pedestal  (1825 samples)
+# HSV_PEDESTAL_LO = np.array([86, 38, 0])
+# HSV_PEDESTAL_HI = np.array([153, 213, 255])
+
+# White ball HSV thresholds.
+# # White = very low saturation, very high brightness.
+# WHITE_H_MIN, WHITE_H_MAX = 0,  180
+# WHITE_S_MIN, WHITE_S_MAX = 0,  80
+# # WHITE_V_MIN, WHITE_V_MAX = 43, 255
+# WHITE_V_MIN, WHITE_V_MAX = 150, 255
+
+# # Blue podium HSV thresholds.
+# # Used to reject white blobs that are NOT above blue (e.g. white floor).
+# BLUE_H_MIN, BLUE_H_MAX = 86,  153
+# BLUE_S_MIN, BLUE_S_MAX = 45,  255
+# BLUE_V_MIN, BLUE_V_MAX = 50,  255
+
+# AT COMPT
+
 # White ball HSV thresholds.
 # White = very low saturation, very high brightness.
-BALL_WHITE_S_MAX  = 70    # max saturation to count as white
-BALL_WHITE_V_MIN  = 150   # min brightness to count as white
+WHITE_H_MIN, WHITE_H_MAX = 0,  180
+WHITE_S_MIN, WHITE_S_MAX = 0, 125
+WHITE_V_MIN, WHITE_V_MAX = 250,  255
 
 # Blue podium HSV thresholds.
 # Used to reject white blobs that are NOT above blue (e.g. white floor).
-BLUE_H_MIN, BLUE_H_MAX = 95,  135
-BLUE_S_MIN, BLUE_S_MAX = 100, 255
-BLUE_V_MIN, BLUE_V_MAX = 60,  230
+BLUE_H_MIN, BLUE_H_MAX = 115,  125
+BLUE_S_MIN, BLUE_S_MAX = 120, 190
+BLUE_V_MIN, BLUE_V_MAX = 156,  254
 
 # Fraction of frame height to search for balls.
 # Ignore the bottom portion to avoid seeing the white floor.
@@ -77,7 +104,60 @@ SEARCH_TOP_FRACTION = 1.0
 
 # Minimum blob area in pixels (at the camera's capture resolution).
 # Avoids picking up small reflections or noise.
-MIN_BALL_AREA_PX = 3000
+MIN_BALL_AREA_PX = 30000
+
+# Minimum blue pedestal blob area in pixels.
+# Filters out tiny blue noise specks that would set a bogus cutoff line.
+# The pedestal should be a large-ish blob; raise if false detections persist.
+MIN_PEDESTAL_AREA_PX = 36000
+
+# Circularity filter for white ball blobs.
+# circularity = 4π·area / perimeter²  →  1.0 = perfect circle, 0 = very elongated.
+#
+# Two-stage threshold based on blob area (area ≈ proximity):
+#   FAR  (small blob)  — ball is fully visible → enforce strict roundness.
+#                        Floor / walls are flat rectangles (circ << 0.4) so a
+#                        high threshold cleanly rejects them.
+#   CLOSE (large blob) — robot is near the pedestal; the bottom of the ball is
+#                        cut off by the pedestal edge, leaving a half-circle or
+#                        D-shape (circ ≈ 0.39–0.55).  Relax the threshold so we
+#                        keep tracking without losing the ball just as we arrive.
+#
+# CIRC_SWITCH_AREA_PX:  blob area above which we switch to the relaxed threshold.
+#                       Tune: run ball_align.py standalone, note the area shown
+#                       when the ball starts getting clipped, set this ~20% below.
+MIN_BALL_CIRCULARITY_FAR   = 0.85   # strict  — full ball visible (far)
+MIN_BALL_CIRCULARITY_CLOSE = 0.50   # relaxed — ball bottom cut off (close)
+CIRC_SWITCH_AREA_PX        = 180_000 # px² — switch to relaxed above this area
+
+# Median blur kernel size applied BEFORE HSV thresholding.
+# Kills isolated salt-and-pepper noise pixels so they never become contours.
+# Must be an odd number. 5 is a good starting point; increase to 7 if small
+# noise blobs still appear after thresholding, but expect slightly softer edges.
+MEDIAN_BLUR_KERNEL = 5
+
+# Solidity filter — rejects hollow / porous blobs that are clearly just noise
+# clusters rather than a real solid object.
+# solidity = contour area / convex hull area  (1.0 = perfectly solid/filled)
+# A real ball or pedestal is a solid filled shape → solidity close to 1.0.
+# A noise cluster with holes and gaps → solidity well below 1.0.
+# Set to 0.0 to disable.
+MIN_BALL_SOLIDITY     = 0.6   # ball blobs must be at least 80% solid
+MIN_PEDESTAL_SOLIDITY = 0.8   # pedestal can be slightly less solid (rectangular)
+
+# ── Temporal stability / flicker suppression ──────────────────────────────────
+# A new detection state must appear this many consecutive frames before it is
+# accepted.  Prevents single-frame noise from causing flickering state changes.
+#
+# DETECT_CONFIRM_FRAMES: frames a NEW ball/pedestal detection must persist
+#   before switching from LOST → detected.
+# DETECT_LOSS_FRAMES: frames detection must be ABSENT before switching to LOST
+#   (hysteresis — once found, we're reluctant to drop it).
+# STATE_CONFIRM_FRAMES: frames a NEW distance_state ("FAR"/"CLOSE") or x_cmd
+#   must persist before it is passed out.  Smooths command jitter.
+DETECT_CONFIRM_FRAMES = 3   # frames needed to confirm a new detection
+DETECT_LOSS_FRAMES    = 5   # frames of absence before declaring LOST
+STATE_CONFIRM_FRAMES  = 3   # frames needed for a state/command change to stick
 
 # Target area in pixels for "CLOSE" distance state.
 # When the ball's white area exceeds this, the robot is close enough.
@@ -85,7 +165,7 @@ MIN_BALL_AREA_PX = 3000
 # From image 1 (backed up): ball fills ~40% of frame → ~0.4 * 640*480 ≈ 120,000px
 # From image 2 (aligned):   ball fills ~50% of frame edge → much larger
 # Start conservative:
-AREA_CLOSE_THRESHOLD = 280_000   # px² — tune upward if robot stops too far away
+AREA_CLOSE_THRESHOLD = 270_000   # px² — tune upward if robot stops too far away
 
 # Lateral tolerance: ball centroid within this many pixels of frame centre = aligned.
 LATERAL_TOL_PX_ALIGN = 30    # px
@@ -100,6 +180,46 @@ ALIGN_STRAFE_POWER = 50   # power for LEFT/RIGHT strafe during alignment
 ALIGN_BACK_POWER   = 200   # power for BACK movement during alignment
 ALIGN_PEDESTAL_STRAFE_POWER = 40  # power when strafing toward pedestal (slower, gentler)
 
+# ── Perpendicularity correction ───────────────────────────────────────────────
+# The robot must approach the pedestal straight-on (perpendicular) so the claw
+# grabs the ball cleanly.  We measure the "skew" of the blue pedestal's top
+# edge: if the robot is angled, one side of the pedestal appears higher in the
+# image than the other.
+#
+#   skew_px = right_top_y - left_top_y  (y=0 is TOP in OpenCV)
+#     > 0  →  right side appears lower (further away)  →  robot angled LEFT   →  TURN RIGHT
+#     < 0  →  left  side appears lower                 →  robot angled RIGHT  →  TURN LEFT
+#     ≈ 0  →  top edge is horizontal  →  robot is perpendicular  ✓
+#
+# PERP_TOL_PX:  skew below this is treated as "perpendicular enough" (r_cmd="STOP").
+# PERP_ROT_MIN/MAX: rotation power limits for the perpendicularity correction.
+# PERP_GAIN:    maps skew_px to rotation power.  Start small — this is a fine trim.
+PERP_TOL_PX   = 8      # px — skew within ±8px = perpendicular enough
+PERP_GAIN     = 0.4    # rotation power per pixel of skew  (8px → 3.2 power units)
+PERP_ROT_MIN  = 5      # minimum rotation power when correcting
+PERP_ROT_MAX  = 20     # maximum rotation power for perpendicularity correction
+
+# ── Search sweep ──────────────────────────────────────────────────────────────
+# When do_ball_align is called with a search_dir, the robot rotates slowly in
+# that direction until it sees the pedestal or ball, then begins alignment.
+# The camera is rear-facing, so:
+#   search_dir="LEFT"  → robot body turns RIGHT (vR = +SEARCH_ROT_POWER)
+#   search_dir="RIGHT" → robot body turns LEFT  (vR = -SEARCH_ROT_POWER)
+SEARCH_ROT_POWER  = 25    # rotation power during sweep (slow and steady)
+SEARCH_TIMEOUT_S  = 16.0   # give up searching after this many seconds
+
+# ── Perpendicularity gate ─────────────────────────────────────────────────────
+# When the pedestal blob width in the image exceeds this threshold, the robot is
+# getting close enough that a bad angle will cause a miss.  Past this threshold,
+# the robot will NOT approach further (y_cmd forced to STOP) until the skew is
+# within PERP_TOL_PX — it only rotates and strafes to fix the angle.
+# Below this threshold the robot approaches freely (still correcting angle, but
+# the approach is allowed even if not yet perfectly perpendicular).
+#
+# Tune: run ball_align.py standalone, back up to comfortable pickup distance,
+# note the blue bbox width_px shown in the debug overlay, set this ~20% less.
+PERP_GATE_WIDTH_PX = 350  # px — approaching blocked until perpendicular above this
+
 # Broadcast port for ball_align telemetry
 # We reuse TELEMETRY_PORT but add ball_align_* fields so mission_controller
 # (which already listens on that port) picks them up automatically.
@@ -109,6 +229,11 @@ BALL_ALIGN_PORT = 5006   # separate port so it doesn't conflict with new_main3
 # Camera resolution for the back camera (use lower for Pi performance)
 BACK_CAM_RESOLUTION = (1280, 720)
 BACK_CAM_FPS        = 30
+
+# ── Debug image saving ────────────────────────────────────────────────────────
+# Set BALL_DEBUG_SAVE_INTERVAL to 0 to disable periodic saves.
+BALL_DEBUG_SAVE_DIR      = "ball_debug_images"
+BALL_DEBUG_SAVE_INTERVAL = 0.0   # seconds between saves (tune to 0 to disable)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -136,14 +261,20 @@ def detect_ball(frame_bgr):
       lateral_err_px:         centroid_x - frame_w/2  (+ = ball right of centre)
     """
     h, w = frame_bgr.shape[:2]
+
+    # ── Median blur — kills isolated noise pixels before thresholding ─────────
+    # Applied to the BGR frame before HSV conversion so salt-and-pepper specks
+    # never make it into the mask at all.
+    frame_bgr = cv2.medianBlur(frame_bgr, MEDIAN_BLUR_KERNEL)
+
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
     # ── White ball mask ───────────────────────────────────────────────────────
     # White = any hue, very low saturation, high value
     white_mask = cv2.inRange(
         hsv,
-        np.array([0,   0,             BALL_WHITE_V_MIN]),
-        np.array([180, BALL_WHITE_S_MAX, 255])
+        np.array([WHITE_H_MIN, WHITE_S_MIN, WHITE_V_MIN]),
+        np.array([WHITE_H_MAX, WHITE_S_MAX, WHITE_V_MAX])
     )
 
     # ── Blue pedestal mask ────────────────────────────────────────────────────
@@ -161,17 +292,33 @@ def detect_ball(frame_bgr):
     white_mask = cv2.bitwise_and(white_mask, search_mask)
 
     # ── Pedestal-aware filtering ──────────────────────────────────────────────
-    # If blue is visible, only keep white blobs that are ABOVE the blue.
+    # If blue is visible, only keep white blobs that are ABOVE the blue pedestal.
+    # FIX: find the largest blue blob first (ensures it's the real pedestal, not
+    # noise), then use that blob's actual bounding-box top edge as the cutoff.
+    # Old code used np.argmax() on a row-sum which returns 0 on all-False arrays
+    # (no blue found) and is fooled by single noisy pixels in the top rows.
     blue_pixels = cv2.countNonZero(blue_mask)
-    if blue_pixels > 500:
-        # Find the topmost row that has significant blue
-        blue_col_sum = np.sum(blue_mask, axis=1)
-        blue_top_row = int(np.argmax(blue_col_sum > 20))
-        if blue_top_row > 0:
-            # Restrict white search to above the blue pedestal
-            above_blue_mask = np.zeros((h, w), dtype=np.uint8)
-            above_blue_mask[:blue_top_row, :] = 255
-            white_mask = cv2.bitwise_and(white_mask, above_blue_mask)
+    pedestal_top_y = None   # will be set if we find a real pedestal blob
+    if blue_pixels > MIN_PEDESTAL_AREA_PX // 4:
+        # Quick pre-morphology check to see if there's enough blue to bother
+        _bk = np.ones((7, 7), np.uint8)
+        _blue_clean = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN,  _bk, iterations=1)
+        _blue_clean = cv2.morphologyEx(_blue_clean, cv2.MORPH_CLOSE, _bk, iterations=2)
+        _bcs, _ = cv2.findContours(_blue_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if _bcs:
+            _best_blue = max(_bcs, key=cv2.contourArea)
+            if cv2.contourArea(_best_blue) >= MIN_PEDESTAL_AREA_PX:
+                # Use the TOP EDGE of the largest blue blob as the cutoff line.
+                # This is the pedestal's actual top boundary in the image.
+                _bbx, _bby, _bbw, _bbh = cv2.boundingRect(_best_blue)
+                pedestal_top_y = _bby   # y=0 is top; blob starts here
+                # Add a small margin so we don't accidentally clip the bottom
+                # of the ball when it sits right on top of the pedestal.
+                PEDESTAL_TOP_MARGIN_PX = 10
+                cutoff_y = max(0, pedestal_top_y - PEDESTAL_TOP_MARGIN_PX)
+                above_blue_mask = np.zeros((h, w), dtype=np.uint8)
+                above_blue_mask[:cutoff_y, :] = 255
+                white_mask = cv2.bitwise_and(white_mask, above_blue_mask)
 
     # ── Morphology to clean noise ─────────────────────────────────────────────
     kernel = np.ones((5, 5), np.uint8)
@@ -183,8 +330,49 @@ def detect_ball(frame_bgr):
     if not contours:
         return None
 
-    # Filter by minimum area
-    valid = [c for c in contours if cv2.contourArea(c) >= MIN_BALL_AREA_PX]
+    # Filter by minimum area AND circularity.
+    # Circularity = 4π·A / P²  (1.0 = perfect circle; floor blobs are << 0.3)
+    # When close up, the bottom of the ball is cut off, leaving a half-circle
+    # shape (circularity ≈ 0.39), so MIN_BALL_CIRCULARITY is set conservatively.
+    def _circularity(c):
+        a = cv2.contourArea(c)
+        p = cv2.arcLength(c, True)
+        if p < 1:
+            return 0.0
+        return (4 * math.pi * a) / (p * p)
+
+    # Categorise every contour for the debug overlay:
+    #   "too_small"   — failed MIN_BALL_AREA_PX
+    #   "not_solid"   — failed solidity (hollow / porous noise cluster)
+    #   "not_round"   — passed area+solidity, failed circularity threshold
+    #   "pass"        — passed all filters → candidate ball
+    #
+    # Circularity threshold is adaptive: large blobs (robot close to ball,
+    # bottom of ball cut off) use the relaxed CLOSE threshold; small blobs
+    # (full ball visible from afar) use the strict FAR threshold.
+    debug_contours = []   # list of (contour, category, circularity)
+    valid = []
+    for c in contours:
+        a = cv2.contourArea(c)
+        circ = _circularity(c)
+        if a < MIN_BALL_AREA_PX:
+            debug_contours.append((c, "too_small", circ))
+            continue
+        # Solidity check — rejects hollow noise clusters
+        hull_area = cv2.contourArea(cv2.convexHull(c))
+        solidity = a / hull_area if hull_area > 0 else 0.0
+        if solidity < MIN_BALL_SOLIDITY:
+            debug_contours.append((c, "not_solid", circ))
+            continue
+        circ_thresh = (MIN_BALL_CIRCULARITY_CLOSE
+                       if a >= CIRC_SWITCH_AREA_PX
+                       else MIN_BALL_CIRCULARITY_FAR)
+        if circ < circ_thresh:
+            debug_contours.append((c, "not_round", circ))
+            continue
+        debug_contours.append((c, "pass", circ))
+        valid.append(c)
+
     if not valid:
         return None
 
@@ -212,10 +400,92 @@ def detect_ball(frame_bgr):
         "frame_w":       w,
         "frame_h":       h,
         "lateral_err_px": cx - w // 2,
-        "blue_visible":  blue_pixels > 500,
+        "blue_visible":  pedestal_top_y is not None,
+        "pedestal_top_y": pedestal_top_y,
         "white_mask":    white_mask,
         "blue_mask":     blue_mask,
+        "debug_contours": debug_contours,
     }
+
+
+def _get_white_debug_contours(frame_bgr):
+    """
+    Re-run the white-mask pipeline and return ALL contours categorised by
+    which filters they pass/fail — used only for the debug mini-mask overlay.
+
+    Returns list of (contour, category, circularity) where category is:
+      "too_small"  — area < MIN_BALL_AREA_PX
+      "not_solid"  — area OK, solidity < MIN_BALL_SOLIDITY (hollow noise cluster)
+      "not_round"  — area + solidity OK, circularity < threshold
+      "pass"       — accepted as a ball candidate
+    """
+    h, w = frame_bgr.shape[:2]
+
+    # Same blur as detect_ball
+    frame_bgr = cv2.medianBlur(frame_bgr, MEDIAN_BLUR_KERNEL)
+
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+
+    white_mask = cv2.inRange(
+        hsv,
+        np.array([WHITE_H_MIN, WHITE_S_MIN, WHITE_V_MIN]),
+        np.array([WHITE_H_MAX, WHITE_S_MAX, WHITE_V_MAX]),
+    )
+    blue_mask = cv2.inRange(
+        hsv,
+        np.array([BLUE_H_MIN, BLUE_S_MIN, BLUE_V_MIN]),
+        np.array([BLUE_H_MAX, BLUE_S_MAX, BLUE_V_MAX]),
+    )
+
+    # Same search-zone restriction as detect_ball
+    search_limit_y = int(h * SEARCH_TOP_FRACTION)
+    search_mask = np.zeros((h, w), dtype=np.uint8)
+    search_mask[:search_limit_y, :] = 255
+    white_mask = cv2.bitwise_and(white_mask, search_mask)
+
+    # Same pedestal cutoff as detect_ball
+    blue_pixels = cv2.countNonZero(blue_mask)
+    if blue_pixels > MIN_PEDESTAL_AREA_PX // 4:
+        _bk = np.ones((7, 7), np.uint8)
+        _bc = cv2.morphologyEx(blue_mask, cv2.MORPH_OPEN,  _bk, iterations=1)
+        _bc = cv2.morphologyEx(_bc,       cv2.MORPH_CLOSE, _bk, iterations=2)
+        _bcs, _ = cv2.findContours(_bc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if _bcs:
+            _bb = max(_bcs, key=cv2.contourArea)
+            if cv2.contourArea(_bb) >= MIN_PEDESTAL_AREA_PX:
+                _, _bby, _, _ = cv2.boundingRect(_bb)
+                cutoff_y = max(0, _bby - 10)
+                above = np.zeros((h, w), dtype=np.uint8)
+                above[:cutoff_y, :] = 255
+                white_mask = cv2.bitwise_and(white_mask, above)
+
+    kernel = np.ones((5, 5), np.uint8)
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_OPEN,  kernel, iterations=1)
+    white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(white_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    result = []
+    for c in contours:
+        a = cv2.contourArea(c)
+        p = cv2.arcLength(c, True)
+        circ = (4 * math.pi * a / (p * p)) if p > 1 else 0.0
+        if a < MIN_BALL_AREA_PX:
+            result.append((c, "too_small", circ))
+            continue
+        hull_area = cv2.contourArea(cv2.convexHull(c))
+        solidity = a / hull_area if hull_area > 0 else 0.0
+        if solidity < MIN_BALL_SOLIDITY:
+            result.append((c, "not_solid", circ))
+            continue
+        circ_thresh = (MIN_BALL_CIRCULARITY_CLOSE
+                       if a >= CIRC_SWITCH_AREA_PX
+                       else MIN_BALL_CIRCULARITY_FAR)
+        if circ < circ_thresh:
+            result.append((c, "not_round", circ))
+        else:
+            result.append((c, "pass", circ))
+    return white_mask, result
 
 
 def detect_pedestal(frame_bgr):
@@ -234,6 +504,10 @@ def detect_pedestal(frame_bgr):
     or None if no blue region found.
     """
     h, w = frame_bgr.shape[:2]
+
+    # ── Median blur — kill noise before thresholding ──────────────────────────
+    frame_bgr = cv2.medianBlur(frame_bgr, MEDIAN_BLUR_KERNEL)
+
     hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
 
     blue_mask = cv2.inRange(
@@ -251,10 +525,16 @@ def detect_pedestal(frame_bgr):
     if not contours:
         return None
 
-    # Pick largest blue blob
+    # Pick largest blue blob; it must be big enough AND solid enough
     best = max(contours, key=cv2.contourArea)
     area = cv2.contourArea(best)
-    if area < 2000:   # ignore tiny blue specks
+    if area < MIN_PEDESTAL_AREA_PX:
+        return None
+
+    # Solidity check — a real pedestal is a solid rectangular blob
+    hull_area = cv2.contourArea(cv2.convexHull(best))
+    solidity = area / hull_area if hull_area > 0 else 0.0
+    if solidity < MIN_PEDESTAL_SOLIDITY:
         return None
 
     M = cv2.moments(best)
@@ -271,11 +551,57 @@ def detect_pedestal(frame_bgr):
         "width_px":      bw,
         "height_px":     bh,
         "bbox":          (bx, by, bw, bh),
+        "top_y":         by,   # topmost pixel row of the pedestal blob
         "frame_w":       w,
         "frame_h":       h,
         "lateral_err_px": cx - w // 2,
         "blue_mask":     blue_mask,
     }
+
+
+def compute_pedestal_skew(blue_mask, bbox):
+    """
+    Measure how skewed the pedestal's top edge is in the camera image.
+
+    A perfectly perpendicular approach produces a horizontal top edge on the
+    pedestal blob.  Any angular misalignment tilts that edge, making one side
+    appear higher (smaller y, since y=0 is the top of the frame) than the other.
+
+    Method: split the pedestal bounding box into left and right halves, find
+    the topmost non-zero row in each half, then compare.
+
+    Returns:
+        skew_px (int):
+          = right_top_y - left_top_y
+          Positive → right side appears LOWER  → robot angled LEFT  → TURN RIGHT (vR > 0)
+          Negative → left  side appears LOWER  → robot angled RIGHT → TURN LEFT  (vR < 0)
+          Zero (or very small) → perpendicular ✓
+        Returns 0 if the blob is too narrow to split reliably.
+    """
+    bx, by, bw, bh = bbox
+    if bw < 60:   # too narrow to split meaningfully
+        return 0
+
+    # Inset slightly from the outer edges to avoid noisy border pixels
+    inset = max(4, bw // 10)
+    mid   = bx + bw // 2
+
+    left_region  = blue_mask[:, bx + inset : mid]
+    right_region = blue_mask[:, mid : bx + bw - inset]
+
+    def _topmost_y(region):
+        """Smallest row-index (topmost in image) that contains a non-zero pixel."""
+        rows = np.any(region > 0, axis=1)
+        idxs = np.where(rows)[0]
+        return int(idxs[0]) if len(idxs) > 0 else None
+
+    left_y  = _topmost_y(left_region)
+    right_y = _topmost_y(right_region)
+
+    if left_y is None or right_y is None:
+        return 0
+
+    return right_y - left_y
 
 
 def compute_align_state(detection, pedestal=None):
@@ -301,7 +627,54 @@ def compute_align_state(detection, pedestal=None):
       distance_state: "FAR" | "CLOSE" | "LOST" | "PEDESTAL"
       x_cmd:          "LEFT" | "RIGHT" | "STOP"
       y_cmd:          "BACK" | "STOP"
+      skew_px:        pedestal top-edge skew (+ = right lower = turn right)
+      r_cmd:          "LEFT" | "RIGHT" | "STOP"  — perpendicularity rotation
     """
+    # ── Perpendicularity from blue pedestal skew ───────────────────────────────
+    # Measure from whichever detection has a blue mask available.
+    # Prefer the pedestal dict (larger, more stable blob) over the ball detection's
+    # smaller blue region at the bottom of the ball image.
+    skew_px = 0
+    _ped_for_skew = pedestal if pedestal is not None else None
+    if _ped_for_skew is None and detection is not None and detection.get("blue_visible"):
+        # Fall back to the blue region captured alongside the ball detection
+        # (detect_ball already runs the blue mask — reuse it)
+        _blue_mask_for_skew = detection.get("blue_mask")
+        if _blue_mask_for_skew is not None:
+            # Build a rough bbox from the blue mask
+            blue_contours, _ = cv2.findContours(
+                _blue_mask_for_skew, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if blue_contours:
+                best_blue = max(blue_contours, key=cv2.contourArea)
+                if cv2.contourArea(best_blue) > 1000:
+                    skew_px = compute_pedestal_skew(
+                        _blue_mask_for_skew, cv2.boundingRect(best_blue))
+    elif _ped_for_skew is not None:
+        skew_px = compute_pedestal_skew(
+            _ped_for_skew["blue_mask"], _ped_for_skew["bbox"])
+
+    # Rotation command from skew
+    if abs(skew_px) <= PERP_TOL_PX:
+        r_cmd = "STOP"
+    elif skew_px > 0:
+        r_cmd = "RIGHT"   # right side lower → robot angled left → turn right
+    else:
+        r_cmd = "LEFT"
+
+    # ── Pedestal width in pixels ───────────────────────────────────────────────
+    # Used by do_ball_align to decide whether to gate the approach.
+    # Take from whichever source is available.
+    ped_width_px = 0
+    if pedestal is not None:
+        ped_width_px = pedestal.get("width_px", 0)
+    elif detection is not None and detection.get("blue_visible"):
+        _bm = detection.get("blue_mask")
+        if _bm is not None:
+            _bcs, _ = cv2.findContours(_bm, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if _bcs:
+                _bb = max(_bcs, key=cv2.contourArea)
+                if cv2.contourArea(_bb) > 500:
+                    ped_width_px = cv2.boundingRect(_bb)[2]
     # ── Case 1: white ball visible ─────────────────────────────────────────────
     if detection is not None:
         lat_err = detection["lateral_err_px"]
@@ -330,9 +703,10 @@ def compute_align_state(detection, pedestal=None):
             "distance_state": "CLOSE" if distance_ok else "FAR",
             "x_cmd":         x_cmd,
             "y_cmd":         y_cmd,
+            "skew_px":       skew_px,
+            "r_cmd":         r_cmd,
+            "pedestal_width_px": ped_width_px,
         }
-
-    # ── Case 2: no ball, pedestal visible → lateral-only fallback ─────────────
     if pedestal is not None:
         lat_err = pedestal["lateral_err_px"]
         lateral_ok = abs(lat_err) < PEDESTAL_LATERAL_TOL_PX
@@ -355,6 +729,9 @@ def compute_align_state(detection, pedestal=None):
             "distance_state": "PEDESTAL",
             "x_cmd":         x_cmd,
             "y_cmd":         "STOP",    # no forward/back in pedestal mode
+            "skew_px":       skew_px,
+            "r_cmd":         r_cmd,
+            "pedestal_width_px": ped_width_px,
         }
 
     # ── Case 3: nothing found ──────────────────────────────────────────────────
@@ -369,7 +746,149 @@ def compute_align_state(detection, pedestal=None):
         "distance_state": "LOST",
         "x_cmd":         "STOP",
         "y_cmd":         "STOP",
+        "skew_px":       0,
+        "r_cmd":         "STOP",
+        "pedestal_width_px": 0,
     }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TEMPORAL STABILITY — flicker suppression
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class DetectionStabilizer:
+    """
+    Wraps detect_ball / detect_pedestal + compute_align_state with temporal
+    smoothing to eliminate single-frame flicker.
+
+    Two independent hysteresis counters:
+
+    1. Detection presence (ball / pedestal / lost):
+       - A NEW source (e.g. LOST→BALL) must appear DETECT_CONFIRM_FRAMES times
+         consecutively before it becomes the accepted state.
+       - An EXISTING source must DISAPPEAR for DETECT_LOSS_FRAMES consecutive
+         frames before we switch away from it (hysteresis keeps the last good
+         state alive briefly so small occlusions don't cause jitter).
+
+    2. Command / state values (x_cmd, distance_state):
+       - The most-recently-emitted value is kept until a DIFFERENT value has
+         appeared STATE_CONFIRM_FRAMES times in a row.  This prevents rapid
+         LEFT/RIGHT or FAR/CLOSE switching caused by a centroid hovering near
+         the tolerance boundary.
+    """
+
+    def __init__(self):
+        # ── Detection source hysteresis ────────────────────────────────────────
+        # accepted source: "ball" | "pedestal" | "lost"
+        self._accepted_src  = "lost"
+        self._candidate_src = "lost"
+        self._candidate_cnt = 0          # consecutive frames the candidate has held
+        self._loss_cnt      = 0          # consecutive frames current source absent
+
+        # Last accepted raw results (used while waiting for confirmation)
+        self._last_detection = None
+        self._last_pedestal  = None
+
+        # ── Command stabilisation ──────────────────────────────────────────────
+        # For each key we track: current emitted value, candidate value, count
+        self._cmd_state = {}   # key → {"current": v, "candidate": v, "cnt": n}
+
+    def _confirm_cmd(self, key: str, new_val):
+        """Return the stable value for a command key, applying hysteresis."""
+        if key not in self._cmd_state:
+            self._cmd_state[key] = {"current": new_val, "candidate": new_val, "cnt": STATE_CONFIRM_FRAMES}
+        s = self._cmd_state[key]
+        if new_val == s["current"]:
+            # Same as current — reset candidate tracking
+            s["candidate"] = new_val
+            s["cnt"] = 0
+            return new_val
+        # Different from current
+        if new_val == s["candidate"]:
+            s["cnt"] += 1
+        else:
+            s["candidate"] = new_val
+            s["cnt"] = 1
+        if s["cnt"] >= STATE_CONFIRM_FRAMES:
+            s["current"]   = new_val
+            s["candidate"] = new_val
+            s["cnt"]       = 0
+        return s["current"]
+
+    def update(self, frame_bgr):
+        """
+        Run detection on a frame and return a temporally-stable
+        (detection, pedestal, state) tuple — same types as the raw functions.
+        """
+        raw_det = detect_ball(frame_bgr)
+        raw_ped = detect_pedestal(frame_bgr) if raw_det is None else None
+
+        # ── Determine raw source this frame ────────────────────────────────────
+        if raw_det is not None:
+            raw_src = "ball"
+        elif raw_ped is not None:
+            raw_src = "pedestal"
+        else:
+            raw_src = "lost"
+
+        # ── Detection source hysteresis ────────────────────────────────────────
+        if raw_src == self._accepted_src:
+            # Continuing with the same source — update last known good data
+            if raw_src == "ball":
+                self._last_detection = raw_det
+            elif raw_src == "pedestal":
+                self._last_pedestal  = raw_ped
+            self._loss_cnt      = 0
+            self._candidate_src = raw_src
+            self._candidate_cnt = 0
+        else:
+            # Source has changed from accepted
+            self._loss_cnt += 1
+
+            # Track consecutive frames of the new candidate
+            if raw_src == self._candidate_src:
+                self._candidate_cnt += 1
+            else:
+                self._candidate_src = raw_src
+                self._candidate_cnt = 1
+
+            # Decide whether to switch
+            if raw_src == "lost":
+                # Require DETECT_LOSS_FRAMES to confirm a loss
+                if self._loss_cnt >= DETECT_LOSS_FRAMES:
+                    self._accepted_src   = "lost"
+                    self._last_detection = None
+                    self._last_pedestal  = None
+            else:
+                # Require DETECT_CONFIRM_FRAMES to confirm a new detection
+                if self._candidate_cnt >= DETECT_CONFIRM_FRAMES:
+                    self._accepted_src = raw_src
+                    self._loss_cnt     = 0
+                    if raw_src == "ball":
+                        self._last_detection = raw_det
+                        self._last_pedestal  = None
+                    else:
+                        self._last_pedestal  = raw_ped
+                        self._last_detection = None
+
+        # ── Compute raw state from accepted source ─────────────────────────────
+        det_to_use = self._last_detection if self._accepted_src == "ball"     else None
+        ped_to_use = self._last_pedestal  if self._accepted_src == "pedestal" else None
+        raw_state  = compute_align_state(det_to_use, ped_to_use)
+
+        # ── Stabilise individual commands ──────────────────────────────────────
+        stable_state = dict(raw_state)
+        for key in ("x_cmd", "y_cmd", "r_cmd", "distance_state"):
+            stable_state[key] = self._confirm_cmd(key, raw_state[key])
+
+        # Re-derive aligned from stabilised commands (so it doesn't flicker either)
+        if stable_state["ball_found"]:
+            stable_state["aligned"] = (
+                stable_state["lateral_ok"] and
+                stable_state["distance_state"] == "CLOSE"
+            )
+
+        return det_to_use, ped_to_use, stable_state
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -482,6 +1001,16 @@ class BallAlignState:
         """True when aligning to the blue pedestal as a fallback (no ball yet)."""
         return self.get().get("pedestal_mode", False)
 
+    @property
+    def skew_px(self) -> int:
+        """Pedestal top-edge skew. Positive = right side lower = robot angled left."""
+        return self.get().get("skew_px", 0)
+
+    @property
+    def r_cmd(self) -> str:
+        """Perpendicularity rotation command: 'LEFT' | 'RIGHT' | 'STOP'."""
+        return self.get().get("r_cmd", "STOP")
+
     def stop(self):
         self._running = False
         try: self._sock.close()
@@ -493,124 +1022,170 @@ class BallAlignState:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def do_ball_align(mc, align_state: BallAlignState,
-                  timeout: float = 30.0, verbose: bool = True) -> bool:
+                  timeout: float = 30.0,
+                  search_dir: str = None,
+                  verbose: bool = True) -> bool:
     """
     Drive the robot until the back camera is aligned with a white ball.
     ball_align.py must be running separately (it opens the back camera).
 
-    This function is called from mission_controller AFTER you've driven
-    the robot to roughly the right position. It does fine lateral + distance
-    adjustment using back camera feedback.
-
     Args:
         mc:          MovementClient instance
         align_state: BallAlignState instance (already listening)
-        timeout:     seconds before giving up
+        timeout:     total seconds before giving up
+        search_dir:  "LEFT" | "RIGHT" | None
+                     If the robot cannot see the ball/pedestal when called,
+                     it rotates in this direction until it finds something,
+                     then begins alignment.
+                     "LEFT"  → rear camera looks left → robot body turns RIGHT (vR > 0)
+                     "RIGHT" → rear camera looks right → robot body turns LEFT  (vR < 0)
+                     None    → skip search, start alignment immediately
         verbose:     print status
 
+    Phases:
+        SEARCH  — rotate slowly in search_dir until pedestal/ball appears.
+        ALIGN   — strafe + perpendicularity-correct + approach simultaneously.
+                  Approach (y_cmd=BACK) is GATED when the pedestal is wide
+                  (robot is close) but the angle is still off:
+                    if pedestal_width_px >= PERP_GATE_WIDTH_PX AND |skew| > PERP_TOL_PX
+                    → hold distance, only rotate/strafe until perpendicular.
+
     Returns True if aligned, False if timed out.
-
-    Usage:
-        # Import at top of mission_controller.py:
-        from ball_align import BallAlignState, do_ball_align
-
-        # In your game loop:
-        align = BallAlignState()
-        success = do_ball_align(mc, align, timeout=20.0)
-        align.stop()
-        if success:
-            mc.action("open_claw")
-            mc.omni(vY=-20)   # push into ball
-            time.sleep(0.5)
-            mc.brake()
-            mc.action("close_claw")
     """
-    # Import here to avoid circular import issues
     from movement_client import MoveCmd
 
     if verbose:
-        print("[ball_align] Starting alignment...")
+        print(f"[ball_align] Starting  search_dir={search_dir}")
 
-    stable = 0
-    t0 = time.time()
+    t0        = time.time()
+    stable    = 0
     loss_time = None
+    phase     = "SEARCH" if search_dir else "ALIGN"
+
     while time.time() - t0 < timeout:
         st = align_state.get()
-
         if not st:
             time.sleep(0.05)
             continue
 
-        if verbose:
-            bf        = st.get("ball_found", False)
-            ped_mode  = st.get("pedestal_mode", False)
-            lat       = st.get("lateral_err_px")
-            dst       = st.get("distance_state", "?")
-            area      = st.get("area", 0)
-            dist_err  = max(0, AREA_CLOSE_THRESHOLD - area)
-            source    = "BALL" if bf else ("PEDESTAL" if ped_mode else "LOST")
-            print(f"  [{source}]  "
-                  f"lat={'---' if lat is None else f'{lat:+.0f}px'}  "
-                  f"dist={dst}  area={area}  "
-                  f"x={st.get('x_cmd','?')}  y={st.get('y_cmd','?')}  "
-                  f"{'✓ ALIGNED' if st.get('aligned') else ''}")
+        ball_found = st.get("ball_found", False)
+        ped_mode   = st.get("pedestal_mode", False)
+        something  = ball_found or ped_mode
+        x_cmd      = st.get("x_cmd",  "STOP")
+        y_cmd      = st.get("y_cmd",  "STOP")
+        r_cmd      = st.get("r_cmd",  "STOP")
+        lat        = st.get("lateral_err_px") or 0
+        skew       = st.get("skew_px", 0)
+        area       = st.get("area", 0)
+        ped_w      = st.get("pedestal_width_px", 0)
+        dist_err   = max(0, AREA_CLOSE_THRESHOLD - area)
 
+        if verbose:
+            src = "BALL" if ball_found else ("PED" if ped_mode else "LOST")
+            print(f"  [{phase}][{src}] "
+                  f"lat={lat:+.0f}px  skew={skew:+d}px  "
+                  f"ped_w={ped_w}px  area={area}  "
+                  f"x={x_cmd} y={y_cmd} r={r_cmd}  "
+                  f"{'✓' if st.get('aligned') else ''}")
+
+        # ── PHASE: SEARCH ──────────────────────────────────────────────────────
+        # Rotate slowly until the pedestal or ball comes into view, then switch.
+        if phase == "SEARCH":
+            if something:
+                if verbose:
+                    print("[ball_align] Target found — switching to ALIGN")
+                phase = "ALIGN"
+                # Fall through into ALIGN logic this same iteration
+            else:
+                # Nothing visible yet — keep rotating toward search_dir
+                # "LEFT" = want camera to look left = robot body turns RIGHT = vR > 0
+                vR = SEARCH_ROT_POWER if search_dir == "LEFT" else -SEARCH_ROT_POWER
+                mc.send(MoveCmd(cmd="omni", vX=0, vY=0, vR=vR))
+                time.sleep(0.05)
+                continue
+
+        # ── PHASE: ALIGN ───────────────────────────────────────────────────────
+        if not something:
+            # Lost sight during alignment — stop and wait briefly
+            loss_time = time.time()
+            mc.brake()
+            time.sleep(0.05)
+            phase = "SEARCH"
+            continue
+
+        # Aligned check with stability counter
         if st.get("aligned"):
             if loss_time and time.time() - loss_time < 1.0:
-                print("[ball_align] Alignment After Loss Rejected!")
-                stable = 0
+                stable = 0   # reject: just recovered from a loss
             elif time.time() - t0 < 0.75:
-                print("[ball_align] Alignment After Start Rejected!")
-                stable = 0
+                stable = 0   # reject: too soon after start
             else:
                 stable += 1
                 if stable >= 5:
                     mc.brake()
-                    if verbose: print("[ball_align] Aligned!")
+                    if verbose:
+                        print("[ball_align] Aligned!")
                     return True
         else:
             stable = 0
 
-        x_cmd    = st.get("x_cmd", "STOP")
-        y_cmd    = st.get("y_cmd", "STOP")
-        ped_mode = st.get("pedestal_mode", False)
-        lat      = st.get("lateral_err_px") or 0
-        area     = st.get("area", 0)
-        dist_err = max(0, AREA_CLOSE_THRESHOLD - area)
-
-        if not st.get("ball_found") and not ped_mode:
-            # Completely lost — stop and wait
-            loss_time = time.time()
-            mc.brake()
-            time.sleep(0.05)
-            continue
-
-        # ── Lateral strafe ─────────────────────────────────────────────────────
-        # Use gentler power when only the pedestal is visible (coarser target).
+        # ── vX: lateral strafe ─────────────────────────────────────────────────
         strafe_base = ALIGN_PEDESTAL_STRAFE_POWER if ped_mode else ALIGN_STRAFE_POWER
         vX = {
             "RIGHT":  strafe_base * abs(lat) / 300,
             "LEFT":  -strafe_base * abs(lat) / 300,
         }.get(x_cmd, 0)
 
-        # ── Back movement ──────────────────────────────────────────────────────
-        # Never commanded in pedestal mode (y_cmd is always "STOP" there).
-        if y_cmd == "BACK":
-            scale = min((dist_err / AREA_CLOSE_THRESHOLD), 1.0)
+        # ── vY: approach — gated by perpendicularity when close ────────────────
+        # If the pedestal blob is already wide (robot is close) AND the robot is
+        # still angled, stop advancing.  Better to fix the angle now than to
+        # arrive at pickup distance misaligned with no room to correct.
+        perp_ok   = abs(skew) <= PERP_TOL_PX
+        gate_hit  = (ped_w >= PERP_GATE_WIDTH_PX and not perp_ok)
+        if gate_hit:
+            vY = 0
+            if verbose and y_cmd == "BACK":
+                print(f"  [PERP GATE] ped_w={ped_w}>={PERP_GATE_WIDTH_PX}, "
+                      f"skew={skew:+d} — holding until perpendicular")
+        elif y_cmd == "BACK":
+            scale = min(dist_err / AREA_CLOSE_THRESHOLD, 1.0)
             vY = -ALIGN_BACK_POWER * scale
         else:
             vY = 0
 
-        mc.send(MoveCmd(cmd="omni", vX=vX, vY=vY, vR=0))
+        # ── vR: perpendicularity trim ──────────────────────────────────────────
+        # skew > 0 → right side lower → robot angled left → TURN RIGHT (vR > 0)
+        # skew < 0 → left  side lower → robot angled right → TURN LEFT  (vR < 0)
+        if r_cmd != "STOP":
+            rot_raw = abs(skew) * PERP_GAIN
+            rot_spd = max(PERP_ROT_MIN, min(PERP_ROT_MAX, rot_raw))
+            vR = rot_spd if skew > 0 else -rot_spd
+        else:
+            vR = 0
+
+        mc.send(MoveCmd(cmd="omni", vX=vX, vY=vY, vR=vR))
         time.sleep(0.05)
 
     mc.brake()
-    if verbose: print("[ball_align] TIMEOUT — alignment failed.")
+    if verbose:
+        print("[ball_align] TIMEOUT — alignment failed.")
     return False
-
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # MAIN — standalone camera loop with live debug display
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _next_save_index(folder: str) -> int:
+    """Return the next available numeric index in folder (existing max + 1)."""
+    os.makedirs(folder, exist_ok=True)
+    existing = []
+    for f in os.listdir(folder):
+        name = os.path.splitext(f)[0]   # strip extension
+        for prefix in ("clean_", "debug_"):
+            if name.startswith(prefix):
+                try: existing.append(int(name[len(prefix):]))
+                except ValueError: pass
+    return max(existing, default=0) + 1
+
 
 def main():
     print("Ball Align — press Q to quit, T to toggle debug overlay")
@@ -647,8 +1222,11 @@ def main():
     for _ in range(5): cap.read()   # warm up
 
     broadcaster = BallAlignBroadcaster()
+    stabilizer  = DetectionStabilizer()
     show_debug  = True
     frame_count = 0
+    last_save_t = 0.0
+    save_idx    = _next_save_index(BALL_DEBUG_SAVE_DIR)
 
     while True:
         ret, frame = cap.read()
@@ -657,10 +1235,7 @@ def main():
             continue
 
         frame_count += 1
-        detection = detect_ball(frame)
-        # Pedestal fallback: only run if no white ball found (saves CPU)
-        pedestal  = detect_pedestal(frame) if detection is None else None
-        state     = compute_align_state(detection, pedestal)
+        detection, pedestal, state = stabilizer.update(frame)
         broadcaster.send(state)
 
         # ── Console output every 10 frames ───────────────────────────────────
@@ -711,14 +1286,25 @@ def main():
                 dst  = state["distance_state"]
                 xcmd = state["x_cmd"]
                 ycmd = state["y_cmd"]
+                skew = state["skew_px"]
+                rcmd = state["r_cmd"]
                 txt = (f"BALL  lat={lat:+.0f}px  {xcmd} | "
-                       f"area={area//1000}k  dist={dst}  {ycmd}")
+                       f"area={area//1000}k  dist={dst}  {ycmd} | "
+                       f"skew={skew:+d}px  {rcmd}")
                 cv2.putText(display, txt, (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                 if state["aligned"]:
                     cv2.putText(display, "ALIGNED", (cx_frame - 60, actual_h - 20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+
+                # Draw a skew indicator: horizontal line through centroid
+                # tilted by skew amount to show the angle visually
+                if abs(skew) > 0:
+                    skew_col = (0, 0, 255) if rcmd != "STOP" else (0, 200, 0)
+                    cv2.putText(display, f"PERP: {rcmd} ({skew:+d}px)",
+                                (10, actual_h - 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, skew_col, 2)
 
             elif pedestal is not None:
                 # Pedestal fallback mode — draw pedestal in blue/orange
@@ -735,7 +1321,10 @@ def main():
 
                 lat  = state["lateral_err_px"]
                 xcmd = state["x_cmd"]
-                txt = f"PEDESTAL (no ball)  lat={lat:+.0f}px  {xcmd}  | waiting for white ball"
+                skew = state["skew_px"]
+                rcmd = state["r_cmd"]
+                txt = (f"PEDESTAL (no ball)  lat={lat:+.0f}px  {xcmd}  "
+                       f"skew={skew:+d}px  {rcmd}  | waiting for white ball")
                 cv2.putText(display, txt, (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, ped_color, 2)
 
@@ -743,21 +1332,93 @@ def main():
                 cv2.putText(display, "LOST — no ball or pedestal", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-            # Show masks side by side at reduced size
-            if detection is not None:
-                wm = cv2.cvtColor(detection["white_mask"], cv2.COLOR_GRAY2BGR)
-                bm = cv2.cvtColor(detection["blue_mask"],  cv2.COLOR_GRAY2BGR)
-                side = np.hstack([wm, bm])
-                scale = 0.3
-                side_small = cv2.resize(side, (int(side.shape[1]*scale),
-                                                int(side.shape[0]*scale)))
-                display[:side_small.shape[0], :side_small.shape[1]] = side_small
-            elif pedestal is not None:
-                bm = cv2.cvtColor(pedestal["blue_mask"], cv2.COLOR_GRAY2BGR)
-                scale = 0.3
-                bm_small = cv2.resize(bm, (int(bm.shape[1]*scale),
-                                           int(bm.shape[0]*scale)))
-                display[:bm_small.shape[0], :bm_small.shape[1]] = bm_small
+            # ── Mini mask panel — colour-coded by filter result ───────────────
+            # Always run the debug contour pass so we can show rejected blobs too.
+            # Colours (BGR):
+            #   GREEN  (0,220,0)    — passed area + roundness → accepted ball
+            #   ORANGE (0,140,255)  — passed area, FAILED roundness (too flat)
+            #   GREY   (120,120,120)— failed area (too small)
+            #   BLUE   (255,60,0)   — blue pedestal mask (right half)
+            _dbg_white_mask, _dbg_contours = _get_white_debug_contours(frame)
+            dbg_h, dbg_w = _dbg_white_mask.shape[:2]
+
+            # Left panel: colour-coded white blobs on black background
+            left_panel = np.zeros((dbg_h, dbg_w, 3), dtype=np.uint8)
+            _cat_color = {
+                "too_small": (120, 120, 120),   # grey
+                "not_solid": (0,   60,  220),   # red — hollow noise cluster
+                "not_round": (0,   140, 255),   # orange — too flat/irregular
+                "pass":      (0,   220,   0),   # green — accepted
+            }
+            for _c, _cat, _circ in _dbg_contours:
+                col = _cat_color[_cat]
+                cv2.drawContours(left_panel, [_c], -1, col, -1)   # filled
+                # Label each blob with its circularity value
+                _M = cv2.moments(_c)
+                if _M["m00"] > 0:
+                    _lx = int(_M["m10"] / _M["m00"])
+                    _ly = int(_M["m01"] / _M["m00"])
+                    cv2.putText(left_panel, f"{_circ:.2f}",
+                                (_lx - 18, _ly + 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1,
+                                cv2.LINE_AA)
+
+            # Right panel: blue pedestal mask
+            right_panel = np.zeros((dbg_h, dbg_w, 3), dtype=np.uint8)
+            _raw_blue = cv2.inRange(
+                cv2.cvtColor(frame, cv2.COLOR_BGR2HSV),
+                np.array([BLUE_H_MIN, BLUE_S_MIN, BLUE_V_MIN]),
+                np.array([BLUE_H_MAX, BLUE_S_MAX, BLUE_V_MAX]),
+            )
+            right_panel[_raw_blue > 0] = (255, 60, 0)   # BGR blue-ish
+
+            # Draw pedestal cutoff line on both panels if applicable
+            if detection is not None and detection.get("pedestal_top_y") is not None:
+                _cy_line = detection["pedestal_top_y"] - 10
+                cv2.line(left_panel,  (0, _cy_line), (dbg_w, _cy_line), (0, 255, 255), 1)
+                cv2.line(right_panel, (0, _cy_line), (dbg_w, _cy_line), (0, 255, 255), 1)
+
+            side = np.hstack([left_panel, right_panel])
+            scale = 0.3
+            side_small = cv2.resize(side, (int(side.shape[1] * scale),
+                                           int(side.shape[0] * scale)),
+                                    interpolation=cv2.INTER_AREA)
+
+            # Legend (drawn on the small panel after resize for legibility)
+            # Also show which circularity mode is active for the largest blob.
+            _lx0, _ly0 = 4, 10
+            for _label, _col in [("pass",      (0,220,0)),
+                                  ("not_round", (0,140,255)),
+                                  ("not_solid", (0,60,220)),
+                                  ("too_small", (120,120,120))]:
+                cv2.putText(side_small, _label, (_lx0, _ly0),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.32, _col, 1, cv2.LINE_AA)
+                _ly0 += 12
+
+            # Show active circularity mode + threshold
+            _ball_area = detection["area"] if detection is not None else 0
+            _circ_mode = "CLOSE" if _ball_area >= CIRC_SWITCH_AREA_PX else "FAR"
+            _circ_thr  = (MIN_BALL_CIRCULARITY_CLOSE
+                          if _ball_area >= CIRC_SWITCH_AREA_PX
+                          else MIN_BALL_CIRCULARITY_FAR)
+            _mode_col  = (0, 200, 255) if _circ_mode == "CLOSE" else (200, 200, 0)
+            cv2.putText(side_small, f"circ:{_circ_mode}>={_circ_thr:.2f}",
+                        (_lx0, _ly0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.32, _mode_col, 1, cv2.LINE_AA)
+
+            display[:side_small.shape[0], :side_small.shape[1]] = side_small
+
+            # ── Periodic debug image save ─────────────────────────────────────
+            now_t = time.time()
+            if BALL_DEBUG_SAVE_INTERVAL > 0 and now_t - last_save_t >= BALL_DEBUG_SAVE_INTERVAL:
+                os.makedirs(BALL_DEBUG_SAVE_DIR, exist_ok=True)
+                clean_path = os.path.join(BALL_DEBUG_SAVE_DIR, f"clean_{save_idx}.jpg")
+                debug_path = os.path.join(BALL_DEBUG_SAVE_DIR, f"debug_{save_idx}.jpg")
+                cv2.imwrite(clean_path, frame)
+                cv2.imwrite(debug_path, display)
+                print(f"  [save] ball_debug #{save_idx} → {BALL_DEBUG_SAVE_DIR}/")
+                save_idx  += 1
+                last_save_t = now_t
 
             if HAS_DISPLAY:
                 win_w = int(960 * DISPLAY_SCALE)

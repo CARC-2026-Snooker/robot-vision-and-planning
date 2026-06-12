@@ -1,0 +1,34 @@
+{
+  "ball": {
+    "n_samples": 11347,
+    "h_ranges": [
+      [
+        14,
+        179
+      ],
+      [
+        0,
+        83
+      ]
+    ],
+    "s_lo": 4,
+    "s_hi": 122,
+    "v_lo": 254,
+    "v_hi": 255,
+    "wrapped": true
+  },
+  "pedestal": {
+    "n_samples": 7007,
+    "h_ranges": [
+      [
+        116,
+        125
+      ]
+    ],
+    "s_lo": 122,
+    "s_hi": 187,
+    "v_lo": 156,
+    "v_hi": 254,
+    "wrapped": false
+  }
+}

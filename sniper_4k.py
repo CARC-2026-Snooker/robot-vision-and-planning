@@ -47,13 +47,14 @@ from config import (
     ANGLE_LOCK_DEG,
     # Ball detection / 4K overlay
     CAM_4K_BALL_RED, CAM_4K_BALL_BLUE,
-    LATERAL_TOL_PX,
+    LATERAL_TOL_PX, CUT_MODE_INCR_PX,
     # Map display
     MAP_SCALE as SCALE, MAP_PADDING as PADDING,
     # Network — for telemetry broadcast
     TELEMETRY_PORT, SNIPER_TELEMETRY_PORT, SNIPER_FIRE_PORT,
     LINE_INTERSECT_BLEND, SNIPER_4K_HEADING_WEIGHT
 )
+
 from tracking import get_global_camera_pose, apply_cam_offset, compute_line_intersections
 
 HAS_DISPLAY = bool(os.environ.get("DISPLAY"))
@@ -68,6 +69,9 @@ BALL_HSV = {
     "Blue": CAM_4K_BALL_BLUE,
 }
 DIST_COEFFS = CAM_4K_DIST_COEFFS
+
+# ── Debug image saving ────────────────────────────────────────────────────────
+SNIPER_DEBUG_SAVE_DIR = "sniper_debug_images"
 
 # ── CUT target-line smoothing ─────────────────────────────────────────────────
 # The TARGET line position is exponentially smoothed over time so that a tag
@@ -85,9 +89,9 @@ DIST_COEFFS = CAM_4K_DIST_COEFFS
 # CUT_TARGET_STALE_S: if NO tags are visible for this many seconds, the smoothed
 # value is discarded and target_col returns None (LOST). Prevents using a very
 # old stale estimate indefinitely.
-CUT_TARGET_ALPHA_RATIO = 0.25   # both tags detected: follow fairly quickly
-CUT_TARGET_ALPHA_DEPTH = 0.10   # single-tag fallback: follow slowly (noisier)
-CUT_TARGET_STALE_S     = 5.0    # discard smoothed value if no tags seen for this long
+CUT_TARGET_ALPHA_RATIO = 0.15   # both tags detected: follow fairly quickly
+CUT_TARGET_ALPHA_DEPTH = 0.03   # single-tag fallback: follow slowly (noisier)
+CUT_TARGET_STALE_S     = 60.0    # discard smoothed value if no tags seen for this long
 
 # ── Load position calibration (same file as new_main3.py) ────────────────────
 # calibration.json is one level up (Carc2026/ root). If absent, identity used.
@@ -219,6 +223,9 @@ class Sniper4kThread(threading.Thread):
         # CUT target-line smoothing state (EMA — persists between frames)
         self._tgt_smooth    = None    # float: current smoothed target column
         self._tgt_last_seen = 0.0     # timestamp of last frame with ≥1 visible tag
+        # Debug image save state
+        self._saved_startup   = False  # flips True after first non-black frame saved
+        self._sniper_save_idx = 0
 
         self.running  = True
         self.detector = Detector(families="tag36h11")
@@ -254,12 +261,22 @@ class Sniper4kThread(threading.Thread):
         mask is a binary uint8 image.
         ball_width_px is the horizontal span of the largest colour blob, or None.
         """
+        h, w = frame_bgr.shape[:2]
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         ranges = BALL_HSV.get(self.ball_color, BALL_HSV["Red"])
         mask = None
         for lo, hi in ranges:
             m = cv2.inRange(hsv, lo, hi)
             mask = m if mask is None else cv2.bitwise_or(mask, m)
+            roi_mask = np.zeros_like(mask)
+            # Ignore top 30
+            TOP = int(h * 0.40)
+            BOT = int(h * 0.95)
+            LEFT = int(w * 0.10)
+            RIGHT = int(w * 0.90)
+            roi_mask[TOP:BOT, LEFT:RIGHT] = 255
+            roi_mask[500:600, 500:600] = 255
+            mask = cv2.bitwise_and(mask, roi_mask)
         # Light morphology to clean noise without destroying small detections
         kernel = np.ones((3, 3), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
@@ -305,6 +322,7 @@ class Sniper4kThread(threading.Thread):
             tag_cy     = None
             tag_tz_live = 0.0   # live optical-axis depth of target tag (metres)
             draw_frame = frame_ud.copy()
+            h, w = draw_frame.shape[:2]
             # Pixel columns of every detected known tag — keyed by tag_id
             # value: (col_px: int, tz_metres: float)
             all_tag_cols: dict = {}
@@ -708,6 +726,38 @@ class Sniper4kThread(threading.Thread):
                 self._ball_col      = ball_col
                 self._target_col    = target_col
                 self._cam_cx        = cam_centre_x
+
+            # ── Debug image save ──────────────────────────────────────────
+            # Save once when the camera first produces a non-black frame,
+            # then again each time a full sniper lock is achieved.
+            # "Clean" = undistorted frame before any overlays.
+            # "Debug" = quarter-res frame with all overlay lines baked in.
+            if not self._saved_startup:
+                mean_val = float(frame_ud.mean())
+                if mean_val > 5.0:   # not a black frame
+                    self._saved_startup = True
+                    import os
+                    os.makedirs(SNIPER_DEBUG_SAVE_DIR, exist_ok=True)
+                    # Find next index
+                    existing = []
+                    for fn in os.listdir(SNIPER_DEBUG_SAVE_DIR):
+                        nm = os.path.splitext(fn)[0]
+                        for pfx in ("clean_", "debug_"):
+                            if nm.startswith(pfx):
+                                try: existing.append(int(nm[len(pfx):]))
+                                except ValueError: pass
+                    idx = max(existing, default=0) + 1
+                    self._sniper_save_idx = idx
+                    cv2.imwrite(
+                        os.path.join(SNIPER_DEBUG_SAVE_DIR, f"clean_{idx}.jpg"),
+                        frame_ud
+                    )
+                    cv2.imwrite(
+                        os.path.join(SNIPER_DEBUG_SAVE_DIR, f"debug_{idx}.jpg"),
+                        frame_small
+                    )
+                    print(f"[Sniper4k] Saved startup frame #{idx} "
+                          f"(mean={mean_val:.1f}) → {SNIPER_DEBUG_SAVE_DIR}/")
 
     def get_state(self):
         with self._lock:
@@ -1191,8 +1241,12 @@ def main():
                 mid_deg = mid_error_px / 100.0
 
             correction  = mid_deg   # drives vR in mission_controller
-            lat_locked  = abs(diff_error_px) < LATERAL_TOL_PX
-            ang_locked  = abs(mid_error_px)  < LATERAL_TOL_PX
+            if SHOT_MODE == "CUT":
+                lat_locked  = abs(diff_error_px) < LATERAL_TOL_PX + CUT_MODE_INCR_PX
+                ang_locked  = abs(mid_error_px)  < LATERAL_TOL_PX
+            else:
+                lat_locked  = abs(diff_error_px) < LATERAL_TOL_PX
+                ang_locked  = abs(mid_error_px)  < LATERAL_TOL_PX
             pos_locked  = lat_locked and ang_locked
 
         else:
