@@ -239,6 +239,12 @@ class Sniper4kThread(threading.Thread):
                 # Horizontal span = ball width in pixels (more stable than fitting a circle)
                 x_bnd, _, w_bnd, _ = cv2.boundingRect(largest)
                 ball_width_px = w_bnd
+
+        # Zero out everything outside the region of interest
+        # roi_mask = np.zeros_like(mask)
+        # roi_mask[int(self._actual_h * 0.30):self._actual_h, 0:self._actual_w] = 255
+        # mask = cv2.bitwise_and(mask, roi_mask)
+        
         return mask, centroid, ball_width_px
 
     def run(self):
@@ -249,6 +255,7 @@ class Sniper4kThread(threading.Thread):
                 continue
 
             # Undistort
+            frame[:int(self._actual_h*0.4)] = 0
             frame_ud = cv2.remap(frame, self.map1, self.map2, cv2.INTER_LINEAR)
 
             # ── AprilTag detection ────────────────────────────────────────

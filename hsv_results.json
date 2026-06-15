@@ -1,0 +1,56 @@
+{
+  "red_ball": {
+    "n_samples": 1960,
+    "h_ranges": [
+      [
+        0,
+        179
+      ],
+      [
+        0,
+        11
+      ]
+    ],
+    "s_lo": 92,
+    "s_hi": 209,
+    "v_lo": 105,
+    "v_hi": 253,
+    "wrapped": true
+  },
+  "blue_ball": {
+    "n_samples": 2352,
+    "h_ranges": [
+      [
+        86,
+        179
+      ],
+      [
+        0,
+        77
+      ]
+    ],
+    "s_lo": 51,
+    "s_hi": 174,
+    "v_lo": 50,
+    "v_hi": 142,
+    "wrapped": true
+  },
+  "background": {
+    "n_samples": 2744,
+    "h_ranges": [
+      [
+        12,
+        179
+      ],
+      [
+        0,
+        35
+      ]
+    ],
+    "s_lo": 72,
+    "s_hi": 118,
+    "v_lo": 42,
+    "v_hi": 54,
+    "wrapped": true
+  }
+}
